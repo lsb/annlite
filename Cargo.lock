@@ -69,6 +69,8 @@ dependencies = [
  "annlite-core",
  "anyhow",
  "clap",
+ "rand",
+ "rand_chacha",
  "rusqlite",
  "serde",
  "serde_json",
