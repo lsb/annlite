@@ -545,8 +545,9 @@ PQ's ADC already satisfies the second form — a document's score needs only its
 
 ### 9.5 Finding: `VACUUM` converts scattered pages into contiguous runs
 
-At 1M, k=10: 2,395 pages in **2,380 runs** before vacuum, the same 2,395 pages in
-**133 runs** after. A client that coalesces adjacent pages goes from ~2,380 requests
+At 1M, k=10: 2,396 pages in **2,380 runs** after `optimize`, and 2,395 pages in
+**133 runs** after `VACUUM` — the same pages, one apart, in a twentieth of the
+requests. A client that coalesces adjacent pages goes from ~2,380 requests
 to ~133 for an identical query on an identical-size file, at zero latency cost. Page
 *count* is unchanged; page *adjacency* is transformed. Given §8.3, that is a ~18x
 reduction in the only quantity that matters.
@@ -1047,7 +1048,87 @@ that the candidate-generation stage is untested here rather than that it is usel
 
 ---
 
-## 16. Open items
+## 16. The scale story
+
+Three scales of the same growing collection — each corpus is a byte-exact prefix of
+the next (section 4.3), so these are points on one curve rather than three separate
+experiments. Dense index: Vamana R=32, alpha=1.1, PQ m=64. Query costs are the
+measured counts put through the model in `tools/analyze/netcost.py`.
+
+### 16.1 What ordering and residency buy, by scale
+
+Mean per query at L=32, beam=4, no rerank. Identical graph, codes, queries and
+parameters within each scale.
+
+| scale | records read | pages, insertion order | pages, BFS | pages, cluster | requests, insertion order | requests, BFS |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10,000 | 978.0 | 420.5 | **280.4** | 355.7 | 49.0 | 64.8 |
+| 100,000 | 1,291.1 | 1,135.3 | **659.5** | 916.3 | 861.3 | **355.4** |
+
+At 10,000 documents BFS ordering cuts pages by a third but *raises* the coalesced
+request count, 49.0 to 64.8. That is not a contradiction: a query there touches most
+of the 500-page table, so insertion order's pages happen to be one long contiguous
+sweep, while BFS's smaller set is scattered across it. The metric that improves
+depends on whether the client fetches pages or ranges, and at that scale the answer
+is "neither matters much". By 100,000 documents both improve together and decisively.
+
+And with codes resident, which changes *when* records are read rather than which:
+
+| scale | records (on disk) | records (resident) | pages (BFS, on disk) | pages (BFS, resident) | requests (BFS, resident) |
+|---:|---:|---:|---:|---:|---:|
+| 10,000 | 978.0 | 44.9 | 280.4 | 37.1 | 30.7 |
+| 100,000 | 1,291.1 | **51.9** | 659.5 | **44.9** | **41.2** |
+
+Recall is identical to three decimals in every resident/on-disk pair and across all
+three orderings, as it must be: the same nodes are scored either way, and a test
+pins it (`ordering_changes_pages_but_not_results`).
+
+**Ordering pays more as the corpus grows.** At 10,000 documents a query touched most
+of the node table, so BFS ordering cut pages by a third while leaving requests no
+better. At 100,000 it cuts pages by 42% *and* requests by 59%, because there is now
+enough table for locality to be a meaningful property rather than a rounding error.
+Cluster ordering lands consistently between the two: grouping by similarity helps,
+but grouping by the graph the search actually walks helps more.
+
+**Residency pays more still, and independently.** It is the larger lever at both
+scales — 1,291 records down to 51.9 at 100,000, a factor of 25 — because it attacks
+a different quantity. Ordering changes *where* records sit; residency changes *how
+many* have to be read at all. Composing them takes 861 requests to 41.
+
+### 16.2 The cost of the things that are not the traversal
+
+Two costs are easy to leave out of a comparison and both are charged here.
+
+**Reranking.** PQ is a candidate generator (section 7.3), so reaching useful recall
+means rescoring a pool against full float32 vectors. At 100,000 documents, L=128,
+beam=16, that lifts recall@10 from 0.342 to **0.434** and adds 99 pages of scattered
+1.5 KB reads — on `lte`, 2.4 s becomes 3.9 s. Reranking is not free and is not
+optional; it is the difference between a mediocre index and a usable one, bought
+with about 60% more time.
+
+**Preloading.** Resident codes cost `n * m` bytes once: 0.64 MB at 10,000, 6.4 MB at
+100,000, 64 MB at a million. The per-query tables exclude that; the session tables in
+`docs/RESULTS.md` include it, and they are the ones that decide the design. On `lte`
+at 100,000 documents the preload is 3.5 s, so it repays after a handful of queries
+and is pure loss for a single one.
+
+### 16.3 Against the baseline
+
+FTS5 at a million documents costs 1,537 pages and 6.1 MB for a median query — **111
+seconds on `lte`, 925 on satellite** (section 9.3). Those are the numbers the dense
+index exists to beat, and at 100,000 documents the best dense configuration answers
+in **842 ms on `lte`** at recall 0.262, or **3.9 s** at recall 0.434 with reranking.
+
+The comparison is not yet like-for-like — different scales, and different notions of
+a correct answer — but the shape is clear: FTS5's cost is dominated by a per-match
+random lookup that grows with the number of matches, while the graph index's cost is
+dominated by a fixed number of hops that grows only with the logarithm of the corpus.
+At a hundred thousand documents that difference is already two orders of magnitude,
+and it is the whole argument for the project.
+
+---
+
+## 17. Open items
 
 * **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
 * **Needed:** an emscripten toolchain for the WASM milestone.
