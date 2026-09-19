@@ -1036,7 +1036,7 @@ being in the repository at all.
 It also shows what late interaction costs. **28,240 bytes per document** — 18x dense
 and, at a mean of 144.8 tokens per document, the dominant term in any storage budget.
 Extrapolated to a million documents that is **28 GB**, against 1.5 GB for dense
-float32 and 64 MB for dense PQ. Exact MaxSim is two to three orders of magnitude
+float32 and 64 MB for dense PQ. Section 15.2 brings it to 646 MB. Exact MaxSim is two to three orders of magnitude
 slower per query than a dense dot product; the exact ratio is not quoted, for the
 contention reason above.
 
@@ -1052,26 +1052,42 @@ implementations of the scoring function agree.
 ### 15.2 PLAID compression on the code corpus
 
 Staged retrieval per section 12, measured against the exact MaxSim ceiling on the
-same 3,366 documents and 500 queries. `cand@k` is the centroid-only ranking;
-`rerank@1` is after exact rescoring of a 100-document pool.
+same 3,366 documents and 500 queries, and on the same embeddings (see the note at
+the end of this section). `cand@k` is the centroid-only ranking; `rerank@1` is after
+exact rescoring of a 100-document pool.
 
-| centroids | bytes/doc | compression | cand@1 | cand@10 | **rerank@1** | ms/query | build |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| exact (no compression) | 27,796 | 1.0x | — | — | **0.456** | 321.8 | — |
-| 512 | 608 | **45.7x** | 0.180 | 0.498 | 0.434 | 36.1 | 24 s |
-| 1,024 | 637 | 43.6x | 0.258 | 0.588 | 0.444 | 36.3 | 48 s |
-| **2,048** | **695** | **39.9x** | 0.314 | 0.672 | **0.454** | **37.3** | 96 s |
+| centroids | bytes/doc | compression | cand@1 | cand@10 | **rerank@1** | build |
+|---:|---:|---:|---:|---:|---:|---:|
+| exact (no compression) | 28,239 | 1.0x | — | — | **0.454** | — |
+| 512 | 617 | **45.7x** | 0.144 | 0.452 | 0.444 | 24 s |
+| **1,024** | **646** | **43.7x** | 0.240 | 0.578 | **0.454** | 48 s |
+| 2,048 | 705 | 40.0x | 0.302 | 0.630 | **0.454** | 97 s |
 
-At 2,048 centroids the index is **40x smaller and 8.6x faster while retaining 99.6%
-of exact quality** (0.454 against 0.456). That is what makes late interaction
-storable at all: 27.8 KB per document extrapolates to 27 GB at a million documents,
-while 695 bytes extrapolates to 695 MB — the same order as the FTS5 baseline's
-730 MB, and therefore in the range a real deployment can consider.
+At 1,024 centroids the index is **43.7x smaller while matching exact quality to three
+decimals** — 0.454 against 0.454. Doubling the centroid count to 2,048 buys a better
+*first-stage* ranking (cand@1 climbs 0.240 to 0.302) but nothing after reranking,
+which is the expected shape: the first stage only has to get the right document into
+the pool, and by 1,024 centroids it already does. 512 centroids is where that stops
+being true, and rerank@1 slips to 0.444.
 
-Raising the centroid count trades compression for a better *first-stage* ranking
-(cand@1 climbs 0.180 to 0.314) because finer centroids approximate tokens better.
-After exact reranking most of that difference disappears, which is the expected
-shape: the first stage only has to get the right document into the pool.
+This is what makes late interaction storable. 28.2 KB per document extrapolates to
+28 GB at a million documents; 646 bytes extrapolates to **646 MB**, the same order as
+the FTS5 baseline's 730 MB, and therefore in the range a real deployment can
+consider.
+
+*Cross-check.* Exact MaxSim was computed independently in Python and in Rust, on the
+same embeddings, and agrees to three decimals: 0.454 success@1 and 0.780 success@10
+in both, with 28,240 against 28,239 bytes per document from integer rounding. That
+is the check that the two implementations of the scoring function agree.
+
+*Provenance.* An earlier version of this table was computed from a different
+encoding than the head-to-head above it. Re-running the encoder without the sequence
+cap rewrote the vector file, while the per-document token-length table that the Rust
+benchmark uses to slice it was produced by a separate manual step and stayed behind
+— 495,075 vectors described by a table covering 487,313. A bounds assertion would
+have caught the mismatch before it produced wrong output, but the *reported* figures
+had already been mixed across two encodings. Both files are now written in the same
+pass, so they cannot diverge, and every number in this section comes from one run.
 
 ### 15.3 Null result: probe width does nothing at this corpus size
 

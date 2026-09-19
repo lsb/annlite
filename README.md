@@ -85,14 +85,14 @@ and so cannot be answered; the attainable ceiling is 0.962, not 1.0.**
 | BM25 (FTS5) | 0.280 | 0.362 | — |
 | Dense (MiniLM) | 0.350 | 0.463 | 1,536 |
 | **Late interaction (LateOn)** | **0.454** | **0.567** | 28,240 |
-| Late interaction + PLAID, 2,048 centroids | 0.454 | — | **695** |
+| Late interaction + PLAID, 1,024 centroids | 0.454 | — | **646** |
 
 As a fraction of the 0.962 attainable: BM25 0.291, dense 0.364, late interaction
 **0.472**.
 
 Late interaction is 62% better than BM25 and 30% better than dense — and 18x dense
-to store, until PLAID staging brings it to 695 bytes per document while keeping
-99.6% of exact quality. (Per-query latency is omitted: these runs shared a machine
+to store, until PLAID staging brings it to 646 bytes per document, a **43.7x
+compression that matches exact quality to three decimals**. (Per-query latency is omitted: these runs shared a machine
 with a million-document index build, so quality is trustworthy and timing is not.)
 
 ### Traps found along the way
