@@ -298,3 +298,8 @@ pub fn kmeans_assign(vectors: &Vectors, k: usize, iters: usize, seed: u64) -> Ve
         })
         .collect()
 }
+
+/// Centroids from clustering whole vectors, alongside [`kmeans_assign`].
+pub fn kmeans_centroids(vectors: &Vectors, k: usize, iters: usize, seed: u64) -> Vec<f32> {
+    kmeans(&vectors.data, vectors.len(), vectors.dim, k.min(vectors.len()).max(1), iters, seed)
+}

@@ -57,6 +57,19 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             id   INTEGER PRIMARY KEY,
             body TEXT
         );
+        -- All PQ codes as one contiguous blob, in new-id order.
+        --
+        -- This exists so a client can fetch every code in ONE sequential range
+        -- request instead of discovering them a page at a time during traversal.
+        -- SQLite stores an oversized blob in a chain of overflow pages allocated
+        -- consecutively, so the read is sequential on disk and coalesces into a
+        -- single HTTP range. Whether paying that fixed cost beats reading codes
+        -- during traversal depends on how many queries a session asks -- see
+        -- tools/analyze/netcost.py.
+        CREATE TABLE IF NOT EXISTS annlite_codeblob (
+            id    INTEGER PRIMARY KEY CHECK (id = 0),
+            codes BLOB NOT NULL
+        );
         "#,
     )?;
     Ok(())
@@ -111,6 +124,20 @@ pub fn write_index(
                 doc_stmt.execute(params![new_id as i64, &d[old]])?;
             }
         }
+    }
+
+    // Codes again, contiguous and in new-id order, for the resident-codes mode.
+    {
+        let mut blob = vec![0u8; n * fmt.m];
+        for new_id in 0..n {
+            let old = perm.old_id_of[new_id] as usize;
+            blob[new_id * fmt.m..(new_id + 1) * fmt.m]
+                .copy_from_slice(&codes[old * fmt.m..(old + 1) * fmt.m]);
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO annlite_codeblob(id, codes) VALUES (0, ?1)",
+            params![blob],
+        )?;
     }
 
     let mut codebook = Vec::with_capacity(pq.centroids.len() * 4);

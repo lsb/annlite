@@ -642,7 +642,177 @@ follow directly and are what the remaining milestones must measure:
 
 ---
 
-## 11. Open items
+## 11. Dense index 2: Vamana, and what node ordering buys
+
+### 11.1 Why Vamana rather than HNSW for this target
+
+Vamana is a single flat graph of fixed out-degree, and both properties matter more
+here than any recall difference:
+
+* **Flat** means one kind of record, so node `i` sits at byte `i * record_size` and
+  the page holding it follows from its id by arithmetic. HNSW's per-node level makes
+  records variable-length and forces an index of indexes.
+* **Fixed degree** means a node plus its entire adjacency fits a known budget, so a
+  record can be sized to divide evenly into a page.
+
+Together they make node ids the thing that decides pages — and ids are ours to
+choose. That is the lever this section measures.
+
+### 11.2 Finding: `alpha` works the opposite way round from the obvious reading
+
+The pruning rule keeps a candidate `v` unless some already-kept neighbour `p*`
+satisfies `alpha * d(p*, v) <= d(p, v)`. Raising `alpha` makes that discard test
+*harder* to pass, so **fewer** candidates are occluded, the graph grows **denser**,
+and its edges get **shorter** — not longer, as the "alpha keeps long-range edges"
+summary suggests.
+
+Measured on 4,000 clustered vectors, R=32:
+
+| alpha | edges | mean edge distance | recall@10 (L=64) |
+|---:|---:|---:|---:|
+| 1.0 | 41,553 | 0.151 | 0.931 |
+| **1.1** | 74,667 | 0.159 | **0.947** |
+| 1.2 | 106,537 | 0.125 | 0.928 |
+| 1.4 | 127,290 | 0.059 | 0.595 |
+| 1.6 | 125,847 | 0.055 | **0.059** |
+| 2.0 | 125,512 | 0.055 | 0.059 |
+
+Past about 1.4 every node saturates at full degree with its nearest neighbours and
+the graph degenerates into an approximate kNN graph — exactly the badly-navigable
+structure that diversified pruning exists to prevent. Recall collapses to 0.059,
+which is consistent with greedy search never escaping the medoid's own cluster
+(1/40 clusters ≈ 0.025 expected by chance).
+
+Scaling the *other* side of the inequality (`d(p*, v) <= alpha * d(p, v)`) was
+implemented and measured too: it prunes ever more aggressively, stripping the graph
+to mean degree 1.3 and recall 0.005. The original reading is correct; the default is
+now **1.1**, the best measured value. Both halves are pinned by a test.
+
+### 11.3 The storage format, and the lesson it inherits from FTS5
+
+A node's record holds its PQ code *beside* its adjacency:
+
+```text
+record := pq_code[m]  degree:u16  neighbours[r]:u32
+```
+
+This is section 9.4's lesson applied directly. FTS5 was slow over the network
+because scoring needed a per-document lookup in a different table; here a single
+page read yields both the score of every node on that page and the ids to hop to
+next. Nothing is looked up twice, and traversal never touches the full vectors at
+all. Storage is ordinary SQLite tables — no virtual table, no loadable extension —
+so a stock WASM build can read it.
+
+At m=64, r=32 the record is **194 bytes** and SQLite packs **20 per 4 KiB page**
+(measured via `dbstat`, against an arithmetic estimate of 21).
+
+### 11.4 Measured: node ordering cuts pages by a third
+
+10,000 documents, 200 queries, R=32, alpha=1.1, m=64. Graph, codes, queries and
+search parameters are identical across the three orderings, so every difference is
+attributable to node numbering alone. Mean distinct pages touched per query:
+
+| L | beam | Identity | BFS | Cluster |
+|---:|---:|---:|---:|---:|
+| 32 | 1 | 403.1 | **271.8** | 337.3 |
+| 32 | 4 | 420.5 | **280.4** | 355.7 |
+| 32 | 16 | 453.4 | **299.3** | 400.2 |
+| 64 | 1 | 455.0 | **339.9** | 402.2 |
+| 128 | 1 | 473.9 | **403.2** | 448.1 |
+
+BFS ordering over the graph is the best of the three, cutting pages by up to **33%**
+for byte-identical results. Insertion order matches the random-access prediction
+almost exactly: 500 pages and 858 reads gives an expected 410 distinct pages against
+403 measured, confirming that unordered ids are simply random with respect to
+locality.
+
+But the ceiling is low. Even BFS touches 272 of 500 pages — 54% of the table — when
+the query read only 858 of 10,000 records. Reordering cannot fix that, because the
+problem is not *where* the records are but *how many* are read.
+
+### 11.5 Finding: resident PQ codes cut pages by up to 18x at identical recall
+
+The traversal above reads a record for **every node it scores**, because a node's
+score lives in its record. Scoring the ~27 neighbours of each expanded node is what
+turns 8 hops into 1,370 record reads.
+
+The alternative is to make the codes resident: download every PQ code once as one
+contiguous blob, and then read a record only for a node the search actually
+*expands*. Same graph, same parameters, same results — only the timing of the reads
+changes. Measured over the same 200 queries:
+
+| L | beam | recall@10 | nodes read (disk) | nodes read (resident) | pages (disk) | pages (resident) | ms (disk) | ms (resident) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 1 | 0.383 | 858.0 | **37.9** | 403.1 | **36.6** | 5.94 | **0.58** |
+| 32 | 4 | 0.395 | 978.0 | **44.9** | 420.5 | **43.0** | 6.78 | **0.63** |
+| 32 | 16 | 0.414 | 1370.5 | **73.5** | 453.4 | **68.4** | 9.45 | **0.90** |
+| 128 | 1 | 0.520 | 2197.9 | **130.7** | 473.9 | **114.7** | 15.63 | **1.80** |
+| 128 | 16 | 0.523 | 2429.1 | **156.7** | 475.0 | **134.2** | 17.29 | **1.78** |
+| 128 | 16 + rerank | **0.732** | 2429.1 | **156.7** | 475.0 | **134.2** | 18.71 | **3.07** |
+
+Recall is **identical to three decimals** in every row — as it must be, since the
+same nodes are scored either way. Pages fall by 6.6x to 18x and local wall-clock by
+around 10x. The fixed cost is the blob: 10,000 x 64 bytes = **640 KB**, fetched once
+per session as a single sequential range.
+
+Under the `lte` profile (70 ms RTT, 15 Mbit/s, six parallel connections), at L=32
+beam=16:
+
+* on-disk: 8 hops x ceil(57 requests per hop / 6) waves x 70 ms + 0.99 s transfer ≈ **6.6 s per query**
+* resident: 0.41 s preload, then 8 x ceil(8.5/6) x 70 ms + 0.15 s ≈ **1.27 s per query**
+
+Resident wins from the very first query at this scale. It will not at every scale:
+the blob is `n * m` bytes, so at a million documents it is 64 MB — about 34 s on
+`lte` — and the crossover moves out to however many queries amortise that. Halving
+`m` to 32 bytes halves the preload and, per section 7.2, costs recall
+(R@10/100 drops 0.992 to 0.870). **The choice is not a property of the index but of
+the session**, which is why `tools/analyze/netcost.py` reports a crossover rather
+than a winner.
+
+### 11.6 Caveat on comparing these numbers to section 10
+
+The Vamana figures above score candidates with **64-byte PQ codes**, while the HNSW
+figures in section 10 score with **full float32 vectors**. The gap between Vamana's
+0.52 recall at L=128 and HNSW's 0.82 at ef=128 is therefore mostly the quantizer,
+not the graph. They are not a like-for-like comparison and should not be read as one.
+
+---
+
+## 12. Late interaction
+
+Implemented following PLAID's staging, and testable on the index mechanics even
+though the encoder's tokenizer is still missing (section 3.2).
+
+MaxSim scores a query against a document by letting every query token take its best
+match among the document's tokens and summing those maxima. It is strictly more
+expressive than a single dot product — a document can match one part of a query
+strongly without diluting that evidence into an average — and ruinously expensive
+stored naively: a 50-word document is ~120 tokens, at 48 float32 dimensions that is
+23 KB per document, so a million documents would be 23 GB.
+
+The compression exploits the fact that token vectors are highly redundant across a
+corpus. Cluster them all; a token becomes a centroid id plus a residual. Retrieval
+then runs in stages of increasing cost and selectivity:
+
+1. **Candidate generation** — each query token probes its nearest centroids and
+   collects documents from an inverted list. No document data is read.
+2. **Centroid interaction** — rank candidates by MaxSim over centroids alone, using
+   only the resident centroid table and the documents' centroid ids.
+3. **Full MaxSim** — decompress and score exactly, for the surviving few.
+
+The staging is the same shape as the dense pipeline and for the same reason: stages
+1 and 2 touch only data that is resident or sequential, and only stage 3 reads
+scattered per-document bytes.
+
+Verified on synthetic multi-vector corpora with known structure: compression exceeds
+10x, the centroid stage recalls over 75% of the exact top 10 into its candidate pool,
+exact reranking puts the true best document first over 80% of the time, and widening
+the probe never shrinks the pool. **Retrieval quality on real text remains blocked on
+the `LateOn-Code-edge` tokenizer.**
+
+---
+
+## 13. Open items
 
 * **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
 * **Needed:** an emscripten toolchain for the WASM milestone.

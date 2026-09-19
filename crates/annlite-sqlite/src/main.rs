@@ -10,7 +10,7 @@ use annlite_core::layout::{bfs_order, cluster_order, Ordering, Permutation};
 use annlite_core::pq::ProductQuantizer;
 use annlite_core::vamana::{Vamana, VamanaParams};
 use annlite_core::vectors::{exact_top_k, Vectors};
-use annlite_sqlite::search::{search, Index};
+use annlite_sqlite::search::{search, search_resident, Index, ResidentCodes};
 use annlite_sqlite::store::{node_page_stats, write_index};
 use anyhow::Result;
 use clap::Parser;
@@ -116,9 +116,10 @@ fn main() -> Result<()> {
         "exact_ms_per_query": exact_ms,
     }))?;
 
-    println!("\n{:>10} {:>5} {:>5} {:>6} {:>8} {:>9} {:>8} {:>7} {:>7} {:>8}",
-             "ordering", "L", "beam", "rrank", "recall10", "nodes", "pages", "runs", "hops", "ms");
-    println!("{}", "-".repeat(90));
+    println!("\n{:>10} {:>9} {:>5} {:>5} {:>6} {:>8} {:>9} {:>8} {:>7} {:>7} {:>8}",
+             "ordering", "mode", "L", "beam", "rrank", "recall10", "nodes", "pages", "runs",
+             "hops", "ms");
+    println!("{}", "-".repeat(101));
 
     for ordering in [Ordering::Identity, Ordering::Bfs, Ordering::Cluster] {
         let perm = match ordering {
@@ -142,20 +143,29 @@ fn main() -> Result<()> {
         let db_bytes = std::fs::metadata(&db_path)?.len();
 
         let idx = Index::open(&conn)?;
+        let resident = ResidentCodes::load(&conn, &idx)?;
         writeln!(out, "{}", serde_json::json!({
             "record": "index", "ordering": format!("{ordering:?}"), "write_seconds": write_s,
             "db_bytes": db_bytes, "node_leaf_pages": node_pages, "records_per_page": per_page,
             "record_bytes": idx.fmt.len(), "count": meta.count,
+            "code_blob_bytes": resident.bytes(),
         }))?;
 
         for &l in &cli.search_l {
           for &beam in &cli.beams {
             for &rerank in &[0usize, 100] {
+              for mode in ["ondisk", "resident"] {
                 let t0 = std::time::Instant::now();
                 let (mut hits, mut nodes, mut pages, mut runs, mut hops, mut vecs, mut vpages) =
                     (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
                 for qi in 0..n_q {
-                    let res = search(&conn, &idx, queries.row(qi), 10, l, beam, rerank)?;
+                    let res = if mode == "resident" {
+                        search_resident(
+                            &conn, &idx, &resident, queries.row(qi), 10, l, beam, rerank,
+                        )?
+                    } else {
+                        search(&conn, &idx, queries.row(qi), 10, l, beam, rerank)?
+                    };
                     let ids: Vec<u32> = res.results.iter().map(|x| x.0).collect();
                     // Gold ids are in the original numbering; map through the permutation.
                     hits += gold[qi][..10]
@@ -172,17 +182,18 @@ fn main() -> Result<()> {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0 / n_q as f64;
                 let f = n_q as f64;
                 let recall = hits as f64 / (n_q * 10) as f64;
-                println!("{:>10} {l:>5} {beam:>5} {rerank:>6} {recall:>8.3} {:>9.1} {:>8.1} {:>7.1} {:>7.1} {ms:>8.2}",
-                         format!("{ordering:?}"), nodes as f64 / f, pages as f64 / f,
+                println!("{:>10} {:>9} {l:>5} {beam:>5} {rerank:>6} {recall:>8.3} {:>9.1} {:>8.1} {:>7.1} {:>7.1} {ms:>8.2}",
+                         format!("{ordering:?}"), mode, nodes as f64 / f, pages as f64 / f,
                          runs as f64 / f, hops as f64 / f);
                 writeln!(out, "{}", serde_json::json!({
-                    "record": "query_set", "ordering": format!("{ordering:?}"),
+                    "record": "query_set", "ordering": format!("{ordering:?}"), "mode": mode,
                     "l": l, "beam": beam, "rerank": rerank, "recall_at_10": recall,
                     "mean_nodes_read": nodes as f64 / f, "mean_distinct_pages": pages as f64 / f,
                     "mean_contiguous_runs": runs as f64 / f, "mean_hops": hops as f64 / f,
                     "mean_vectors_read": vecs as f64 / f, "mean_rerank_pages": vpages as f64 / f,
                     "ms_per_query": ms,
                 }))?;
+              }
             }
           }
         }

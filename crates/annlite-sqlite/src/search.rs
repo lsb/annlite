@@ -84,6 +84,41 @@ pub struct SearchCost {
     pub contiguous_runs: usize,
 }
 
+/// All PQ codes held client-side, fetched once per session.
+///
+/// With codes resident, traversal fetches a node record only when it *expands* that
+/// node, because scoring its neighbours no longer requires reading them. That turns
+/// the per-query cost from "one fetch per scored node" into "one fetch per expanded
+/// node", which measurement showed to be roughly an order of magnitude fewer.
+pub struct ResidentCodes {
+    pub codes: Vec<u8>,
+    pub m: usize,
+}
+
+impl ResidentCodes {
+    /// Fetch the whole code blob. One sequential range request.
+    pub fn load(conn: &Connection, idx: &Index) -> Result<Self> {
+        let codes: Vec<u8> =
+            conn.query_row("SELECT codes FROM annlite_codeblob WHERE id = 0", [], |r| r.get(0))?;
+        anyhow::ensure!(
+            codes.len() == idx.count * idx.fmt.m,
+            "code blob is {} bytes, expected {}",
+            codes.len(),
+            idx.count * idx.fmt.m
+        );
+        Ok(Self { codes, m: idx.fmt.m })
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.codes.len()
+    }
+
+    #[inline]
+    fn code(&self, id: u32) -> &[u8] {
+        &self.codes[id as usize * self.m..(id as usize + 1) * self.m]
+    }
+}
+
 pub struct SearchResult {
     pub results: Vec<(u32, f32)>,
     pub cost: SearchCost,
@@ -231,4 +266,100 @@ impl SearchCost {
     pub fn contiguous_runs_estimate(&self) -> usize {
         self.contiguous_runs
     }
+}
+
+/// Beam search with the PQ codes already client-side.
+///
+/// The difference from [`search`] is only in *when* a record is read. Candidates are
+/// scored from resident codes, so a record is fetched only for a node the search
+/// decides to expand. Results are identical to [`search`] given the same parameters;
+/// the costs are not.
+pub fn search_resident(
+    conn: &Connection,
+    idx: &Index,
+    codes: &ResidentCodes,
+    query: &[f32],
+    k: usize,
+    l: usize,
+    beam: usize,
+    rerank: usize,
+) -> Result<SearchResult> {
+    let table = idx.pq.score_table(query);
+    let layout = idx.page_layout();
+    let mut cost = SearchCost::default();
+    let mut pages: HashSet<usize> = HashSet::new();
+    let mut stmt = conn.prepare_cached("SELECT rec FROM annlite_nodes WHERE id = ?1")?;
+
+    let l = l.max(k).max(1);
+    let mut list: Vec<(u32, f32, bool)> =
+        vec![(idx.medoid, table.score(codes.code(idx.medoid)), false)];
+    let mut seen: HashSet<u32> = HashSet::from([idx.medoid]);
+
+    loop {
+        let frontier: Vec<u32> = list
+            .iter_mut()
+            .filter(|e| !e.2)
+            .take(beam.max(1))
+            .map(|e| {
+                e.2 = true;
+                e.0
+            })
+            .collect();
+        if frontier.is_empty() {
+            break;
+        }
+        cost.hops += 1;
+
+        let mut discovered: Vec<u32> = Vec::new();
+        for id in frontier {
+            let rec: Vec<u8> = stmt.query_row([id as i64], |r| r.get(0))?;
+            cost.nodes_read += 1;
+            pages.insert(layout.page_of(id));
+            let (_, neighbors) = idx.fmt.decode(&rec)?;
+            for nb in neighbors {
+                if seen.insert(nb) {
+                    discovered.push(nb);
+                }
+            }
+        }
+        if discovered.is_empty() {
+            continue;
+        }
+        // Scoring costs nothing over the network: the codes are already here.
+        for id in discovered {
+            list.push((id, table.score(codes.code(id)), false));
+        }
+        list.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        list.truncate(l);
+    }
+
+    cost.distinct_pages = pages.len();
+    let mut sorted: Vec<usize> = pages.into_iter().collect();
+    sorted.sort_unstable();
+    cost.contiguous_runs = sorted.windows(2).filter(|w| w[1] != w[0] + 1).count()
+        + usize::from(!sorted.is_empty());
+
+    let mut results: Vec<(u32, f32)> = list.iter().map(|e| (e.0, e.1)).collect();
+    if rerank > 0 {
+        let depth = rerank.min(results.len());
+        let mut vstmt = conn.prepare_cached("SELECT v FROM annlite_vectors WHERE id = ?1")?;
+        let vec_layout = PageLayout { page_bytes: PAGE_BYTES, record_bytes: idx.dim * 4 + 10 };
+        let mut vpages: HashSet<usize> = HashSet::new();
+        let mut rescored = Vec::with_capacity(depth);
+        for &(id, _) in results.iter().take(depth) {
+            let raw: Vec<u8> = vstmt.query_row([id as i64], |r| r.get(0))?;
+            cost.vectors_read += 1;
+            vpages.insert(vec_layout.page_of(id));
+            let v: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            rescored.push((id, annlite_core::vectors::dot(query, &v)));
+        }
+        cost.rerank_pages = vpages.len();
+        rescored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        results = rescored;
+    }
+    results.truncate(k);
+    Ok(SearchResult { results, cost })
 }
