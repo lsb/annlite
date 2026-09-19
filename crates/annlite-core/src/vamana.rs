@@ -155,7 +155,17 @@ impl Vamana {
         }
 
         let batch = batch.max(1);
-        for &alpha in &[1.0f32, params.alpha.max(1.0)] {
+        // Construction at a million nodes runs for hours. Reporting progress is not
+        // decoration: without it there is no way to tell a slow build from a stuck
+        // one, and no basis for deciding whether to wait. Cost per insert grows with
+        // the graph, so the estimate is deliberately based on the rate observed so
+        // far in this pass rather than on a constant extrapolated from the start.
+        let started = std::time::Instant::now();
+        let total_inserts = (n * 2) as f64;
+        let mut done_inserts = 0usize;
+        let mut last_report = std::time::Instant::now();
+
+        for (pass, &alpha) in [1.0f32, params.alpha.max(1.0)].iter().enumerate() {
             for chunk in order.chunks(batch) {
                 let found: Vec<(u32, Vec<u32>)> = chunk
                     .par_iter()
@@ -176,8 +186,24 @@ impl Vamana {
                 for (p, visited) in found {
                     idx.apply(vectors, p, visited, alpha);
                 }
+
+                done_inserts += chunk.len();
+                if last_report.elapsed().as_secs() >= 30 {
+                    let frac = done_inserts as f64 / total_inserts;
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let remaining = if frac > 0.0 { elapsed / frac - elapsed } else { 0.0 };
+                    eprintln!(
+                        "    pass {}/2  {:>6.2}%  {:.0}s elapsed, ~{:.0}s remaining",
+                        pass + 1,
+                        frac * 100.0,
+                        elapsed,
+                        remaining
+                    );
+                    last_report = std::time::Instant::now();
+                }
             }
         }
+        eprintln!("    graph complete in {:.0}s", started.elapsed().as_secs_f64());
         idx
     }
 
