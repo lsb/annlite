@@ -184,7 +184,7 @@ const CONTROL_PREFIX: &str = "/__netsim/";
 fn serve(cfg: &Config, root: &Path, log: &RequestLog, job: Job) {
     let Job { ordinal, t_ms, accepted, request } = job;
     let method = request.method().as_str().to_string();
-    let (raw_path, query) = split_url(request.url());
+    let (raw_path, _query) = split_url(request.url());
     let range_header = header_value(&request, "Range");
     let label = header_value(&request, "X-Netsim-Label").unwrap_or_else(|| log.label());
 
@@ -205,7 +205,6 @@ fn serve(cfg: &Config, root: &Path, log: &RequestLog, job: Job) {
         profile: cfg.sim.profile_name,
         mode: cfg.sim.mode,
     };
-    let _ = query;
 
     // The latency is charged to every request that reaches the network, including
     // preflights and errors: the browser waits for those round-trips too.
@@ -269,6 +268,9 @@ fn serve(cfg: &Config, root: &Path, log: &RequestLog, job: Job) {
             }
         }
     };
+    // A client hanging up mid-body is ordinary (a browser abandoning a fetch) and
+    // must not take the worker down. The record is written either way, so an
+    // abandoned transfer still shows up as a round-trip that was paid for.
     let _ = result;
 
     rec.service_ms = accepted.elapsed().as_secs_f64() * 1e3;

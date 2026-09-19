@@ -72,7 +72,12 @@ fn build_query_and_page_counting() {
         query::Query { qid: 1, kind: "random".into(), k: 1, text: "kappa".into(), source_doc: None },
     ];
     let page_size = db::PAGE_SIZE as u64;
-    let measured = pages::measure(&dbp, &queries, &sql, 10, page_size).unwrap();
+    let map = {
+        let c = Connection::open(&dbp).unwrap();
+        let pc: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+        db::page_table_map(&c, pc as u64).unwrap()
+    };
+    let measured = pages::measure(&dbp, &queries, &sql, 10, page_size, Some(&map)).unwrap();
     assert_eq!(measured.len(), 2);
     let total_pages = report.stats.page_count as usize;
     for m in &measured {
@@ -83,6 +88,12 @@ fn build_query_and_page_counting() {
         assert_eq!(
             m.cache_miss as usize, m.distinct_pages,
             "VFS xRead count and DBSTATUS_CACHE_MISS disagree"
+        );
+        // Attribution must account for every page, and must name the inverted index.
+        assert_eq!(m.by_table.iter().map(|(_, c)| c).sum::<usize>(), m.distinct_pages);
+        assert!(
+            m.by_table.iter().any(|(n, _)| n == "docs_data"),
+            "no inverted-index pages attributed: {:?}", m.by_table
         );
     }
 

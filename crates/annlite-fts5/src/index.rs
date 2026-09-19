@@ -148,6 +148,31 @@ pub fn optimize(db_path: &Path, with_dbstat: bool) -> Result<OptimizeReport> {
     Ok(OptimizeReport { optimize_secs, stats })
 }
 
+/// Run `VACUUM`, rewriting the database without its free pages.
+///
+/// `optimize` merges the segments but leaves the pages the old segments occupied on
+/// the freelist, so the *file* gets bigger even as the index gets tighter. On a local
+/// disk that is invisible; a static file on a CDN pays for those bytes on every cold
+/// fetch and the freelist interleaves live pages, so it is measured as its own phase.
+pub fn vacuum(db_path: &Path, with_dbstat: bool) -> Result<VacuumReport> {
+    let conn = Connection::open(db_path)?;
+    for (k, v) in BULK_LOAD_PRAGMAS.iter().filter(|(k, _)| *k != "page_size") {
+        conn.pragma_update(None, k, *v)?;
+    }
+    let t0 = Instant::now();
+    conn.execute_batch("VACUUM")?;
+    let vacuum_secs = t0.elapsed().as_secs_f64();
+    let stats = db::stats(&conn, db_path, with_dbstat)?;
+    conn.close().map_err(|(_, e)| e)?;
+    Ok(VacuumReport { vacuum_secs, stats })
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct VacuumReport {
+    pub vacuum_secs: f64,
+    pub stats: db::DbStats,
+}
+
 /// Number of FTS5 segments in the index, read from the structure record.
 ///
 /// Reported before and after `optimize` because it is the mechanism behind the change

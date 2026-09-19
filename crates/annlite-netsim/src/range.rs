@@ -15,6 +15,10 @@
 //!   `416` with `Content-Range: bytes */TOTAL`, which is how a client discovers the
 //!   length it guessed wrong about.
 //!
+//! `If-Range` is not implemented: conditional range retrieval only matters to a
+//! client resuming a transfer of an entity that may have changed underneath it,
+//! and the files here are static for the life of a benchmark.
+//!
 //! Multi-range requests (`bytes=0-9,20-29`) are answered with the full body rather
 //! than a `multipart/byteranges` document. The RFC permits a server to ignore a
 //! Range header, no SQLite VFS emits multi-range, and a half-correct multipart

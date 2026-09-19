@@ -41,6 +41,9 @@ struct Cli {
     /// Reuse an existing database instead of rebuilding (skips the build measurement).
     #[arg(long)]
     reuse_db: bool,
+    /// Skip the VACUUM phase that reclaims the pages `optimize` frees.
+    #[arg(long)]
+    skip_vacuum: bool,
 }
 
 /// What one query cost, from the timed pass.
@@ -76,6 +79,20 @@ fn sql_for(limit_param: bool) -> String {
     } else {
         format!("SELECT count(*) FROM {t} WHERE {t} MATCH ?1")
     }
+}
+
+/// The same retrieval without the ranking function.
+///
+/// Run only for its page counts. BM25 needs the length of every matching document, and
+/// FTS5 keeps those in a separate `%_docsize` table keyed by rowid, so ranking adds one
+/// random row lookup per candidate on top of reading the posting lists. Measuring the
+/// query with and without `ORDER BY bm25()` splits the page cost into "find the
+/// candidates" and "score them", which is exactly the split the ANN indexes will have
+/// to be judged on. Bound with LIMIT -1 so it enumerates every match, as the ranked
+/// query must.
+fn sql_unranked() -> String {
+    let t = index::TABLE;
+    format!("SELECT rowid FROM {t} WHERE {t} MATCH ?1 LIMIT ?2")
 }
 
 fn run_latency(conn: &Connection, queries: &[query::Query], limit: usize) -> Result<Vec<LatencyOutcome>> {
@@ -234,8 +251,9 @@ fn main() -> Result<()> {
             b.n_docs, b.build_secs, b.docs_per_sec, b.mib_per_sec
         );
         println!(
-            "       db {} bytes, {} pages of {} B, {:.1} B/doc, {:.2}x corpus size",
-            b.stats.file_bytes, b.stats.page_count, b.stats.page_size, b.bytes_per_doc,
+            "       db {} bytes, {} pages of {} B ({} free), {:.1} B/doc, {:.2}x corpus size",
+            b.stats.file_bytes, b.stats.page_count, b.stats.page_size, b.stats.freelist_count,
+            b.bytes_per_doc,
             b.stats.file_bytes as f64 / b.corpus_bytes as f64
         );
         if let Some(t) = &b.stats.per_table {
@@ -349,9 +367,17 @@ fn main() -> Result<()> {
 
         // ---- page access --------------------------------------------------------
         let base = pages::open_prepare_baseline(&db_path, &sql_for(true))?;
-        let po = pages::measure(&db_path, &queries, &sql_for(true), cli.limit, db::PAGE_SIZE as u64)?;
+        // The page -> table map is rebuilt per phase: optimize and vacuum both move
+        // pages between the shadow tables.
+        let table_map = {
+            let c = Connection::open(&db_path)?;
+            let pc: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            if with_dbstat { Some(db::page_table_map(&c, pc as u64)?) } else { None }
+        };
+        let po = pages::measure(
+            &db_path, &queries, &sql_for(true), cli.limit as i64, db::PAGE_SIZE as u64, table_map.as_ref())?;
         let cross = pages::measure_fresh_connection(
-            &db_path, &queries, &sql_for(true), cli.limit, db::PAGE_SIZE as u64, cli.crosscheck,
+            &db_path, &queries, &sql_for(true), cli.limit as i64, db::PAGE_SIZE as u64, cli.crosscheck,
         )?;
         println!("\n-- {phase}: pages touched per query (cold pager cache, 4 KiB pages) --");
         println!("connection open + prepare alone: {} distinct pages, {} xRead calls",
@@ -366,14 +392,59 @@ fn main() -> Result<()> {
             let rc = Dist::of(&sel.iter().map(|o| o.read_calls as f64).collect::<Vec<_>>());
             let by = Dist::of(&sel.iter().map(|o| o.bytes_read as f64).collect::<Vec<_>>());
             let cm = Dist::of(&sel.iter().map(|o| o.cache_miss as f64).collect::<Vec<_>>());
+            // Mean distinct pages per query attributed to each shadow table.
+            let mut tables: std::collections::BTreeMap<String, f64> = Default::default();
+            for o in &sel {
+                for (name, c) in &o.by_table {
+                    *tables.entry(name.clone()).or_default() += *c as f64 / sel.len() as f64;
+                }
+            }
             out.write(json!({
                 "record": "pages", "scale": scale.name, "phase": phase, "group": label,
                 "method": "xRead interception, PRAGMA shrink_memory before each query",
                 "distinct_pages": dp, "contiguous_runs": runs, "read_calls": rc,
                 "bytes_read": by, "cache_miss_dbstatus": cm,
+                "mean_pages_by_table": tables,
             }))?;
-            println!("{}", fmt_dist(&label, &dp, "pages"));
+            let breakdown = tables
+                .iter()
+                .filter(|(_, v)| **v >= 0.05)
+                .map(|(n, v)| format!("{n} {v:.1}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            println!("{}  runs med={:>8.0}  | {}", fmt_dist(&label, &dp, "pages"), runs.median, breakdown);
         }
+        // Same queries, no ORDER BY bm25(): posting lists only. The limit is -1 (no
+        // limit) so that both variants enumerate every candidate — a LIMIT without an
+        // ORDER BY would stop early and understate the unranked cost.
+        let unranked = pages::measure(
+            &db_path, &queries, &sql_unranked(), -1, db::PAGE_SIZE as u64, table_map.as_ref())?;
+        println!("\n-- {phase}: pages without ORDER BY bm25() (posting lists only) --");
+        for (label, pred) in groups(&queries) {
+            let sel: Vec<&pages::PageOutcome> = unranked.iter().filter(|o| pred(&o.kind, o.k)).collect();
+            if sel.is_empty() || !(label == "all" || label.starts_with("kind=known_item,")) {
+                continue;
+            }
+            let dp = Dist::of(&sel.iter().map(|o| o.distinct_pages as f64).collect::<Vec<_>>());
+            let runs = Dist::of(&sel.iter().map(|o| o.contiguous_runs as f64).collect::<Vec<_>>());
+            let ranked = Dist::of(
+                &po.iter().filter(|o| pred(&o.kind, o.k)).map(|o| o.distinct_pages as f64).collect::<Vec<_>>());
+            let mut tables: std::collections::BTreeMap<String, f64> = Default::default();
+            for o in &sel {
+                for (name, c) in &o.by_table {
+                    *tables.entry(name.clone()).or_default() += *c as f64 / sel.len() as f64;
+                }
+            }
+            out.write(json!({
+                "record": "pages_unranked", "scale": scale.name, "phase": phase, "group": label,
+                "sql": sql_unranked(), "distinct_pages": dp, "contiguous_runs": runs,
+                "mean_pages_by_table": tables,
+                "ranked_distinct_pages_mean": ranked.mean,
+            }))?;
+            println!("{}  runs med={:>8.0}  | ranked mean {:.1} -> unranked mean {:.1}",
+                fmt_dist(&label, &dp, "pages"), runs.median, ranked.mean, dp.mean);
+        }
+
         let agree = po.iter().filter(|o| o.cache_miss as usize == o.distinct_pages).count();
         let cross_d = Dist::of(&cross.iter().map(|&x| x as f64).collect::<Vec<_>>());
         out.write(json!({
@@ -405,6 +476,7 @@ fn main() -> Result<()> {
                 "match_count": q.match_count, "rank": q.rank,
                 "best_bm25": q.best_score, "tied_at_best": q.tied_at_best,
                 "distinct_pages": p.map(|p| p.distinct_pages),
+                "pages_by_table": p.map(|p| p.by_table.clone()),
                 "contiguous_runs": p.map(|p| p.contiguous_runs),
                 "read_calls": p.map(|p| p.read_calls),
                 "bytes_read": p.map(|p| p.bytes_read),
@@ -427,8 +499,9 @@ fn main() -> Result<()> {
         "record": "optimize", "scale": scale.name,
         "optimize": opt, "segments_before": segs_before, "segments_after": segs_after,
     }))?;
-    println!("\noptimize: {:.2}s, segments {} -> {}, db {} bytes / {} pages",
-        opt.optimize_secs, segs_before, segs_after, opt.stats.file_bytes, opt.stats.page_count);
+    println!("\noptimize: {:.2}s, segments {} -> {}, db {} bytes / {} pages, freelist {}",
+        opt.optimize_secs, segs_before, segs_after, opt.stats.file_bytes, opt.stats.page_count,
+        opt.stats.freelist_count);
     if let Some(t) = &opt.stats.per_table {
         for t in t {
             println!("       {:<16} {:>10} pages {:>14} payload bytes", t.name, t.pages, t.payload_bytes);
@@ -436,6 +509,16 @@ fn main() -> Result<()> {
     }
 
     run_phase("post_optimize", &mut out)?;
+
+    // ---- vacuum ------------------------------------------------------------------
+    if !cli.skip_vacuum {
+        eprintln!("[{}] running VACUUM", scale.name);
+        let vac = index::vacuum(&db_path, with_dbstat)?;
+        out.write(json!({ "record": "vacuum", "scale": scale.name, "vacuum": vac }))?;
+        println!("\nvacuum: {:.2}s, db {} bytes / {} pages, freelist {}",
+            vac.vacuum_secs, vac.stats.file_bytes, vac.stats.page_count, vac.stats.freelist_count);
+        run_phase("post_vacuum", &mut out)?;
+    }
 
     out.file.flush()?;
     println!("\nresults -> {}", out_path.display());

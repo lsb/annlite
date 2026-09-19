@@ -15,12 +15,30 @@ bytes fetched as well as milliseconds.
 | Milestone | State |
 |---|---|
 | Deterministic corpora + query sets | **done** |
-| HTTP byte-range server with latency/throughput simulation | in progress |
-| FTS5 baseline | in progress |
-| Dense ANN (HNSW + PQ, 64 B/doc) | planned |
-| DiskANN / Vamana page-local index | planned |
+| HTTP byte-range server with latency/throughput simulation | **done** |
+| FTS5 baseline (to 1M docs) | **done** |
+| Product quantization (64 B/doc) | **done** |
+| HNSW, validated against `hnswlib` | **done** |
+| DiskANN / Vamana page-local index | next |
 | Late interaction (fast-plaid style) | blocked — see below |
 | WASM browser demo | planned |
+
+### Headline results so far
+
+* **Round-trips are the whole cost.** 32 sequential 4 KiB page fetches over
+  satellite spend 20.1 s waiting and 55 ms transferring. Reducing bytes is worth
+  little; reducing *dependent fetches* is worth almost everything.
+* **FTS5 does not survive the network at 1M documents.** A single-term query touches
+  689 distinct pages and reads 2.8 MB — about 48 s at a 70 ms RTT.
+* **BM25, not the inverted index, is what scatters the reads.** Finding candidates
+  costs 20 pages; scoring them costs 1,538, a 79x difference, because FTS5 does one
+  random `%_docsize` lookup per match.
+* **`VACUUM` turns 2,380 scattered requests into 133 contiguous ones** for the same
+  query on the same pages — free, and the single biggest lever found so far.
+* **PQ at 64 bytes is a candidate generator, not a ranker**: 99.2% of the exact
+  top-10 lands in its top-100, but only 61% in its top-10.
+
+See [RESEARCH_LOG.md](RESEARCH_LOG.md) for methodology and full tables.
 
 **Blocked:** late interaction needs the `tokenizer.json` for `LateOn-Code-edge`.
 `huggingface.co` is unreachable from the build environment and no `tokenizer.json`
@@ -42,6 +60,7 @@ is which; they were identified from graph structure and verified by running them
 ```sh
 apt-get install wamerican      # supplies /usr/share/dict/words
 make corpora queries           # regenerate all benchmark data
+make fts5                      # run the FTS5 baseline at all scales
 make test                      # run the Rust test suite
 ```
 
@@ -73,6 +92,7 @@ collection rather than three unrelated samples. Digests land in
 ```
 crates/annlite-core      index algorithms: PQ, HNSW, Vamana/DiskANN, late interaction
 crates/annlite-corpus    deterministic corpus and query-set generation
+crates/annlite-fts5      FTS5 baseline: build cost, latency, quality, page access
 crates/annlite-netsim    HTTP range server with latency/throughput simulation
 data/corpus              generated (gitignored); rebuild with `make corpora`
 bench/results            measurement output

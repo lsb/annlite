@@ -97,6 +97,47 @@ pub fn stats(conn: &Connection, path: &std::path::Path, with_dbstat: bool) -> Re
     })
 }
 
+/// Map every page of the file to the table it belongs to, via `dbstat`.
+///
+/// Page counts alone say how much a query costs; this says *what* it is paying for.
+/// FTS5 spreads one logical table over several shadow tables — `%_data` holds the
+/// inverted index, `%_content` the stored documents, `%_docsize` the per-document
+/// lengths BM25 needs — and they have very different access patterns. Pages that
+/// `dbstat` does not list are on the freelist or are lock/pointer-map pages; they are
+/// labelled `unallocated`.
+///
+/// Returns a vector indexed by 1-based page number, holding an index into the returned
+/// name table.
+pub fn page_table_map(conn: &Connection, page_count: u64) -> Result<(Vec<u16>, Vec<String>)> {
+    let mut names: Vec<String> = vec!["unallocated".to_string()];
+    let mut map = vec![0u16; page_count as usize + 1];
+    let mut st = conn.prepare("SELECT name, pageno FROM dbstat")?;
+    let mut rows = st.query([])?;
+    let mut last: Option<(String, u16)> = None;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(0)?;
+        let pageno: i64 = r.get(1)?;
+        let id = match &last {
+            Some((n, id)) if *n == name => *id,
+            _ => {
+                let id = match names.iter().position(|n| *n == name) {
+                    Some(i) => i as u16,
+                    None => {
+                        names.push(name.clone());
+                        (names.len() - 1) as u16
+                    }
+                };
+                last = Some((name, id));
+                id
+            }
+        };
+        if pageno >= 0 && (pageno as usize) < map.len() {
+            map[pageno as usize] = id;
+        }
+    }
+    Ok((map, names))
+}
+
 /// `SQLITE_DBSTATUS_CACHE_MISS` for this connection, resetting the counter.
 ///
 /// Used as an independent cross-check on the VFS read counter: it is SQLite's own

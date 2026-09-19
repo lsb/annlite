@@ -60,6 +60,8 @@ pub struct PageOutcome {
     pub bytes_read: u64,
     /// SQLite's own cache-miss count for the same query.
     pub cache_miss: i32,
+    /// Distinct pages broken down by the table that owns them.
+    pub by_table: Vec<(String, usize)>,
 }
 
 /// Open a read-only connection through the counting VFS.
@@ -96,8 +98,10 @@ pub fn measure(
     db_path: &Path,
     queries: &[crate::query::Query],
     sql: &str,
-    limit: usize,
+    // Bound to the statement's LIMIT; SQLite reads -1 as "no limit".
+    limit: i64,
     page_size: u64,
+    table_map: Option<&(Vec<u16>, Vec<String>)>,
 ) -> Result<Vec<PageOutcome>> {
     let conn = open_counting(db_path)?;
     let mut stmt = conn.prepare(sql)?;
@@ -107,18 +111,31 @@ pub fn measure(
         conn.execute_batch("PRAGMA shrink_memory")?;
         let _ = db::take_cache_miss(&conn);
         vfs::record_start();
-        let mut rows = stmt.query(rusqlite::params![expr, limit as i64])?;
+        let mut rows = stmt.query(rusqlite::params![expr, limit])?;
         while let Some(r) = rows.next()? {
             let _: i64 = r.get(0)?;
         }
         drop(rows);
         let trace = vfs::record_take();
         let cache_miss = db::take_cache_miss(&conn);
+        let touched = trace.pages(page_size);
+        let by_table = match table_map {
+            Some((map, names)) => {
+                let mut counts = vec![0usize; names.len()];
+                for p in &touched {
+                    let idx = *map.get(*p as usize).unwrap_or(&0) as usize;
+                    counts[idx] += 1;
+                }
+                names.iter().cloned().zip(counts).filter(|(_, c)| *c > 0).collect()
+            }
+            None => Vec::new(),
+        };
         out.push(PageOutcome {
             qid: q.qid,
             kind: q.kind.clone(),
             k: q.k,
-            distinct_pages: trace.pages(page_size).len(),
+            by_table,
+            distinct_pages: touched.len(),
             contiguous_runs: trace.contiguous_runs(page_size),
             read_calls: trace.read_calls(),
             bytes_read: trace.bytes(),
@@ -136,7 +153,7 @@ pub fn measure_fresh_connection(
     db_path: &Path,
     queries: &[crate::query::Query],
     sql: &str,
-    limit: usize,
+    limit: i64,
     page_size: u64,
     sample: usize,
 ) -> Result<Vec<usize>> {
@@ -147,7 +164,7 @@ pub fn measure_fresh_connection(
         {
             let conn = open_counting(db_path)?;
             let mut stmt = conn.prepare(sql)?;
-            let mut rows = stmt.query(rusqlite::params![expr, limit as i64])?;
+            let mut rows = stmt.query(rusqlite::params![expr, limit])?;
             while let Some(r) = rows.next()? {
                 let _: i64 = r.get(0)?;
             }

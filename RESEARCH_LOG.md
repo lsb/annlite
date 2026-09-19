@@ -403,7 +403,246 @@ reranking policy is what decides whether the result is any good.
 
 ---
 
-## 8. Open items
+## 8. Network simulation (`annlite-netsim`)
+
+An HTTP server that serves byte ranges under a simulated link, so "how many pages
+does this query touch" can be converted into "how long does this query take on a
+phone". Built to interoperate with `sql.js-httpvfs`: correct 206/416 semantics,
+`Content-Range`, suffix and open-ended ranges, CORS with `Content-Range` exposed
+(without which the browser cannot read it and httpvfs breaks), and path-traversal
+refusal both lexically and after `canonicalize`.
+
+### 8.1 The delay model
+
+`delay = Lognormal(median = rtt, sigma) + [with probability p] Exponential(mean = spike)`.
+
+Lognormal because measured cell RTT is right-skewed — bounded below by the radio's
+scheduling floor, unbounded above. The separate spike term exists because a pure
+lognormal produces no multi-hundred-millisecond stalls, and those are precisely what
+destroys an index needing a dozen *dependent* round-trips; the causes are physically
+distinct (scheduling jitter versus retransmission, handover, idle-state transition)
+so the parameters are distinct too.
+
+Reproducibility works the same way as the corpus generator: each request derives a
+ChaCha8 stream from `SHA-256("annlite/netsim/v1/" ‖ domain ‖ seed ‖ ordinal)`, so a
+replay of the same request sequence draws the same delays, on any machine. Two
+separate server processes on the same seed produced byte-identical delay sequences.
+Ordinals are assigned single-threaded at accept; a worker pool then does the
+sleeping, so parallel fetches stay parallel without making the draws depend on
+scheduling.
+
+`/__netsim/reset` resets the ordinal, so bracketing each query makes every query see
+the *same* delay sequence — two indexes then differ by access pattern rather than by
+which one happened to draw a spike.
+
+### 8.2 Profiles
+
+| profile | RTT ms | spike p | Mbit/s | basis |
+|---|---:|---:|---:|---|
+| `ideal` | 0 | – | inf | control: keeps "40 round-trips" separable from "40 round-trips cost 2.8 s" |
+| `wifi` | 15 | 0.005 | 50 | 802.11 plus a short hop to a well-peered edge |
+| `5g` | 35 | 0.015 | 100 | NR mid-band sub-frame scheduling |
+| `lte` | 70 | 0.03 | 15 | LTE RAN adds ~40-60 ms over the wired path |
+| `leo` | 45 | 0.05 | 80 | ~550 km is only ~4 ms of propagation; RTT is ground network, spikes are hand-offs |
+| `3g` | 200 | 0.06 | 1.6 | rate from DevTools "Fast 3G"; RTT from measured HSPA+ rather than DevTools' pessimistic 562 ms |
+| `slow-3g` | 2000 | 0.08 | 0.4 | DevTools "Slow 3G" verbatim |
+| `satellite` | 600 | 0.04 | 20 | physics: 35,786 km is ~477 ms at c, plus terrestrial tail |
+
+### 8.3 Measured: latency dwarfs transfer at every scale
+
+32 sequential 4 KiB page fetches — what a page-faulting SQLite reader does — over
+128 KiB of payload:
+
+| profile | wall | sum latency | sum transfer |
+|---|---:|---:|---:|
+| ideal | 225 ms | 0 | 0 |
+| wifi | 836 ms | 499 ms | 21 ms |
+| lte | 2,903 ms | 2,531 ms | 75 ms |
+| 3g | 10,849 ms | 9,843 ms | 713 ms |
+| satellite | 20,520 ms | 20,125 ms | 55 ms |
+
+Satellite spends 20.1 s waiting and 55 ms transferring. **Bandwidth is almost
+irrelevant; round-trip count is everything.** Every index decision in this project
+should be read through that table. Reducing bytes fetched is worth little; reducing
+*the number of dependent fetches* is worth almost everything.
+
+---
+
+## 9. Baseline: FTS5
+
+Measured on this machine, SQLite 3.46.0, page size 4096, single transaction,
+`journal_mode=OFF`. Every figure below comes from a run that completed; nothing is
+extrapolated.
+
+### 9.1 Build and size
+
+| Scale | Build | Throughput | DB size | Pages | Bytes/doc |
+|---|---:|---:|---:|---:|---:|
+| 100 | 0.003 s | — | 139 KB | 34 | 1,393 |
+| 10k | 0.39 s | 25,473 docs/s | 8.88 MB | 2,167 | 888 |
+| **1M** | **56.4 s** | **17,741 docs/s** | **730.6 MB** | 178,371 | 731 |
+
+Throughput degrades ~30% from 10k to 1M as segment merges kick in. At 1M the file
+splits `docs_content` 70% / inverted index 28% — **the stored documents, not the
+index, are the bulk.**
+
+**`optimize` makes the file bigger.** It merges segments but leaves the old pages on
+the freelist: at 10k the file grew 8.88 MB → 11.31 MB (+27%) while the index itself
+got tighter. `VACUUM` then brought it to 7.66 MB, 14% *below* the as-built size.
+Serving a post-`optimize` file over a CDN would ship 32% dead pages. The deployment
+recipe is `optimize` **then** `VACUUM`, not `optimize` alone.
+
+### 9.2 Query latency (warm cache, median, post-vacuum)
+
+| Scale | k=1 | k=2 | k=3 | k=5 | k=10 |
+|---|---:|---:|---:|---:|---:|
+| 100 | 17 µs | 22 | 28 | 39 | 67 |
+| 10k | 23 µs | 35 | 47 | 73 | 141 |
+| 1M | 793 µs | 1,509 | 2,247 | 3,744 | **7,934** |
+
+Linear in both term count and corpus size, and query *kind* barely matters, because
+this corpus gives every term nearly the same document frequency. `LIMIT 100` prunes
+nothing: `ORDER BY bm25()` must score every match first.
+
+### 9.3 Page access — why FTS5 cannot be served over HTTP at 1M
+
+Distinct 4 KiB pages per query, cold pager cache. Measured with a pass-through VFS
+recording every `xRead`, cross-checked against `SQLITE_DBSTATUS_CACHE_MISS` — the two
+agreed on **9,000 of 9,000 queries** across all scales and phases.
+
+| Scale | median pages | p95 | mean KiB read |
+|---|---:|---:|---:|
+| 100 | 7 | 13 | 30.8 |
+| 10k | 26 | 41 | 108.4 |
+| **1M** | **1,537** | **2,402** | **6,230** |
+
+Median pages by term count at 1M: **689 / 1,179 / 1,538 / 1,986 / 2,395**.
+
+A single-term query at 1M touches **689 distinct pages and reads 2.8 MB**. At the
+`lte` profile's 70 ms RTT and one request per page that is **48 seconds**. This is
+the result the baseline existed to establish: **FTS5 as shipped is not viable over
+HTTP ranges at a million documents.**
+
+### 9.4 Finding: the ranking function scatters the access pattern, not the index
+
+Re-running the same queries without `ORDER BY bm25()` (and `LIMIT -1`, so both
+variants still enumerate every candidate):
+
+| Scale | ranked, mean pages | unranked, mean pages | ratio |
+|---|---:|---:|---:|
+| 100 | 7.7 | 6.4 | 1.2x |
+| 10k | 27.1 | 10.9 | 2.5x |
+| **1M** | **1,557.6** | **19.8** | **79x** |
+
+*Finding* the candidates at 1M costs 20 pages. *Scoring* them costs 1,538, because
+`%_docsize` is a separate rowid-keyed table and FTS5 does one random row lookup per
+matching document — a 10-term query touches 2,352 of that table's 2,454 pages.
+
+This is the single most transferable lesson for the ANN designs: **co-locate whatever
+the scorer needs with the postings, or make the scorer need nothing per candidate.**
+PQ's ADC already satisfies the second form — a document's score needs only its own
+64 bytes and a table held in memory.
+
+### 9.5 Finding: `VACUUM` converts scattered pages into contiguous runs
+
+At 1M, k=10: 2,395 pages in **2,380 runs** before vacuum, the same 2,395 pages in
+**133 runs** after. A client that coalesces adjacent pages goes from ~2,380 requests
+to ~133 for an identical query on an identical-size file, at zero latency cost. Page
+*count* is unchanged; page *adjacency* is transformed. Given §8.3, that is a ~18x
+reduction in the only quantity that matters.
+
+### 9.6 Caveat the ANN comparison must carry: FTS5 at k=1 is not ranking
+
+At 1M, `known_item` k=1 scores success@1 = 0.000 and success@100 = 0.130. That is not
+a ranking failure, it is a **tie**. Every vocabulary term has the same document
+frequency and every document the same length, so all ~681 documents containing a
+single query term receive *identical* BM25 scores and the gold document's position
+among them is arbitrary. success@100 = 0.130 is exactly 100/681 in expectation.
+
+**An ANN system must not be credited for "beating FTS5 at k=1" — it would be beating
+a coin flip.** A fair lexical comparison needs tie-aware scoring or a corpus with
+varied term frequencies. Overall known-item figures: 100 → success@1 1.000; 10k →
+0.826, MRR@100 0.8755; 1M → 0.760, MRR@100 0.7796.
+
+Note also that the measured queries select `rowid` and score only, so `docs_content`
+— 70% of the file — is never read. That is the right comparison against an ANN index
+that also returns ids, but a snippet-displaying application pays roughly one extra
+page per displayed result.
+
+---
+
+## 10. Dense index 1: HNSW
+
+### 10.1 Implementation notes
+
+The graph is built over **exact** vectors even when search scores with PQ codes:
+graph quality depends on getting neighbour relationships right, and a bad edge is
+permanent while a bad query-time score costs one comparison.
+
+Visit tracking uses a generation-stamped buffer rather than a fresh `vec![false; n]`
+per layer search. At a million documents the allocation and zeroing alone would make
+construction quadratic; bumping a counter makes the reset free.
+
+### 10.2 Validation against a reference implementation
+
+Recall looked low, so before tuning anything the implementation was checked against
+`hnswlib` on identical data, identical parameters, identical ground truth
+(10k documents, 200 held-out queries, exact inner product):
+
+| ef | this implementation | hnswlib | ms/query (this) | ms/query (hnswlib) |
+|---:|---:|---:|---:|---:|
+| 10 | 0.359 | 0.284 | 0.252 | 0.011 |
+| 50 | 0.678 | 0.613 | 0.756 | 0.036 |
+| 100 | 0.815 | 0.749 | 1.274 | 0.060 |
+| 200 | **0.912** | **0.884** | 2.110 | 0.110 |
+
+*(M=16, efConstruction=200 for both.)*
+
+**Recall is not the problem** — this implementation matches and slightly exceeds the
+reference at every `ef`. Speed is: ~19x slower per query and ~65x slower to build
+(71 s versus 1.1 s), which is the expected cost of scalar Rust against heavily
+SIMD-optimised, multi-threaded C++. For a research harness measuring *round-trips*
+that is an acceptable trade; it would not be acceptable in the shipped WASM.
+
+### 10.3 Finding: the corpus is intrinsically hard for graph ANN
+
+A diagnostic over three datasets, all 10k x 384, all with **held-out** queries.
+(The first version of this diagnostic used corpus members as queries and produced
+recall 1.000 everywhere — a query that is itself a document is found by greedy
+descent almost for free. The numbers below are after fixing that.)
+
+| dataset | 10th-NN sim | mean sim | contrast | recall@10 at ef=10 | at ef=200 |
+|---|---:|---:|---:|---:|---:|
+| synthetic, tight clusters | 0.979 | 0.010 | 8.88 | 0.383 | 0.805 |
+| synthetic, uniform sphere | 0.160 | 0.000 | 3.07 | 0.137 | 0.825 |
+| real MiniLM word-bag embeddings | 0.647 | **0.488** | 2.69 | 0.359 | **0.912** |
+
+The real embeddings are the *easiest* of the three for HNSW, yet still need `ef=200`
+— visiting roughly 2% of a 10,000-document corpus — to reach 0.91 recall, where a
+well-conditioned benchmark set reaches 0.95 at `ef=50`.
+
+The reason is visible in the `mean sim` column: **0.488**. MiniLM embeddings occupy a
+narrow cone rather than the whole sphere, so every document is somewhat similar to
+every other and the gap between "nearest" and "typical" is small relative to the
+spread. Graph descent has weak gradient to follow.
+
+**Consequence for the network target.** `ef=200` at 10k means ~200 distance
+evaluations against vectors that, over HTTP, live in different pages. Per §8.3 that
+is not a CPU cost but a round-trip cost, and on `lte` it is minutes. Two mitigations
+follow directly and are what the remaining milestones must measure:
+
+1. **Keep candidates in the compressed domain.** PQ codes at 64 bytes put 64
+   documents in a 4 KiB page, so a 200-candidate traversal can touch a handful of
+   pages instead of 200 — provided the graph's neighbours are laid out together,
+   which HNSW does not do.
+2. **Lay the graph out for locality.** HNSW assigns node ids in insertion order and
+   its neighbour lists point anywhere, so consecutive hops land on unrelated pages.
+   This is what Vamana/DiskANN is for, and §9.5 already showed the size of the prize:
+   the same pages in 133 runs instead of 2,380.
+
+---
+
+## 11. Open items
 
 * **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
 * **Needed:** an emscripten toolchain for the WASM milestone.

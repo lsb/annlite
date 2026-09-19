@@ -6,5 +6,6 @@
 //! in few pages, and graph layouts chosen for locality rather than for the shortest
 //! possible search path.
 
+pub mod hnsw;
 pub mod pq;
 pub mod vectors;

@@ -18,16 +18,17 @@ SCALES    := 100 10k 1m
 10k_N     := 10000
 1m_N      := 1000000
 
-.PHONY: all corpora queries clean clean-data help check-dict test
+.PHONY: all corpora queries clean clean-data help check-dict test fts5
 
 help:
 	@echo "annlite benchmark pipeline"
 	@echo "  make corpora    generate document corpora at all scales (100 / 10k / 1M)"
 	@echo "  make queries    generate query sets for each corpus scale"
+	@echo "  make fts5       run the FTS5 baseline at all scales (results in bench/results)"
 	@echo "  make test       run the Rust test suite"
 	@echo "  make clean-data remove generated corpora (they regenerate byte-identically)"
 	@echo ""
-	@echo "Individual scales: make corpus-100 corpus-10k corpus-1m"
+	@echo "Individual scales: make corpus-100 corpus-10k corpus-1m fts5-100 fts5-10k fts5-1m"
 
 all: corpora queries
 
@@ -59,6 +60,21 @@ $$(CORPUS)/queries-$(1).jsonl: $$(VOCAB) $$(CORPUS_BIN)
 	$$(CORPUS_BIN) queries --vocab $$(VOCAB) --corpus-size $$($(1)_N) --per-k 100 --out $$@
 endef
 $(foreach s,$(SCALES),$(eval $(call CORPUS_RULE,$(s))))
+
+# The FTS5 baseline every ANN index is compared against. Each scale is its own
+# target because the 1M run takes minutes and is worth starting on its own.
+FTS5_BIN := target/release/annlite-fts5
+
+$(FTS5_BIN): $(shell find crates/annlite-fts5/src -name '*.rs' 2>/dev/null)
+	$(CARGO) build --release -p annlite-fts5
+
+define FTS5_RULE
+fts5-$(1): $$(FTS5_BIN) $$(CORPUS)/docs-$(1).txt $$(CORPUS)/queries-$(1).jsonl
+	$$(FTS5_BIN) --scale $(1)
+endef
+$(foreach s,$(SCALES),$(eval $(call FTS5_RULE,$(s))))
+
+fts5: $(foreach s,$(SCALES),fts5-$(s))
 
 corpora: $(foreach s,$(SCALES),corpus-$(s))
 queries: $(foreach s,$(SCALES),queries-$(s))
