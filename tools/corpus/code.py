@@ -35,6 +35,32 @@ MIN_DOC_CHARS = 30
 MAX_DOC_CHARS = 300
 
 
+def escape(code: str) -> str:
+    """A function's source as one corpus line.
+
+    Line number is the document id, exactly as in the word corpora, so a document has
+    to fit on one line; newlines and backslashes are escaped rather than dropped.
+    """
+    return code.replace("\\", "\\\\").replace("\n", "\\n")
+
+
+def unescape(line: str) -> str:
+    """One corpus line back to the source it stands for.
+
+    Every reader must apply this before indexing or embedding: left alone, the `\\n`
+    markers reach a tokenizer as a stray backslash and `n`, which changes both the
+    document length BM25 divides by and the tokens the encoder sees.
+
+    Note that the replacements are *not* a strict inverse of `escape`: source that
+    literally contains a backslash followed by `n` comes back as a backslash followed
+    by a newline. The order is kept anyway, because every measurement published
+    against this corpus -- Python and Rust alike -- decodes it this way, and changing
+    it would silently move results on the documents it affects rather than fixing
+    anything already reported.
+    """
+    return line.rstrip("\n").replace("\\n", "\n").replace("\\\\", "\\")
+
+
 def _first_sentence(doc: str) -> str:
     text = " ".join(doc.strip().split())
     for stop in (". ", "! ", "? "):
@@ -151,7 +177,7 @@ def main() -> int:
     # word corpora. Newlines inside code are escaped rather than dropped.
     with open(docs_path, "w", encoding="utf-8") as f:
         for it in items:
-            f.write(it["code"].replace("\\", "\\\\").replace("\n", "\\n") + "\n")
+            f.write(escape(it["code"]) + "\n")
     with open(qs_path, "w", encoding="utf-8") as f:
         for it in items:
             f.write(json.dumps({

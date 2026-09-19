@@ -107,15 +107,43 @@ and so cannot be answered; the attainable ceiling is 0.962, not 1.0.**
 | BM25 (FTS5) | 0.280 | 0.362 | — |
 | Dense (MiniLM) | 0.350 | 0.463 | 1,536 |
 | **Late interaction (LateOn)** | **0.454** | **0.567** | 28,240 |
-| Late interaction + PLAID, 1,024 centroids | 0.454 | — | **646** |
+| PLAID staging, 1,024 centroids, no rerank | 0.240 | 0.343 | **928** |
+| PLAID staging + exact rerank of 100 | **0.454** | **0.563** | 29,196 |
 
 As a fraction of the 0.962 attainable: BM25 0.291, dense 0.364, late interaction
 **0.472**.
 
-Late interaction is 62% better than BM25 and 30% better than dense — and 18x dense
-to store, until PLAID staging brings it to 646 bytes per document, a **43.7x
-compression that matches exact quality to three decimals**. (Per-query latency is omitted: these runs shared a machine
+Late interaction is 62% better than BM25 and 30% better than dense. The compression
+story needs care, though, because the cheap configuration and the accurate one are
+not the same configuration. PLAID's centroid representation is 43.7x smaller than raw
+token vectors, but that configuration scores 0.240; reaching 0.454 means reranking
+against uncompressed vectors, which puts the stored file back at 29 KB per document.
+This implementation has PLAID's staging and centroid compression but **not its
+residual quantization**, which is what would let reranking happen in the compressed
+domain. That is the clearest open gap in the project. (Per-query latency is omitted: these runs shared a machine
 with a million-document index build, so quality is trustworthy and timing is not.)
+
+Late interaction now has a SQLite form with the same page accounting as the dense
+index, so its cost is comparable and not only its quality. Mean per query over the
+same 500 queries, 1,024 centroids:
+
+| stage | pages | requests | payload |
+|---|---:|---:|---:|
+| candidate generation (postings) | 108 | 40 | 175 KB |
+| centroid interaction | 484 | **2** | 1.98 MB |
+| exact rerank of 100 | **1,199** | **97** | 4.51 MB |
+
+**Two dependent hops without reranking, three with** — there is no graph to walk, and
+that does not change with corpus size. Reranking is 67% of the pages, as it was for
+the dense index. The centroid stage reads *every* page of its arena on every query,
+because at this corpus size the inverted list prunes nothing, so it should be
+downloaded once and held resident. Variable-length per-document code lists keep the
+id-to-page arithmetic by pairing one contiguous arena with a 4-byte-per-document
+offsets directory; padding to a fixed size would have cost 5.6x. And the 646 above
+counts only codes and centroids: a file that can answer a query also carries the
+inverted lists and that directory, so it is **928 bytes per document** — and 29,196
+if the configuration reranks exactly, because that needs the uncompressed vectors.
+[RESEARCH_LOG §15.4](RESEARCH_LOG.md).
 
 ### Traps found along the way
 

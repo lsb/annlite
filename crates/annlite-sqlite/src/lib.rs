@@ -5,5 +5,7 @@
 //! result. The index lives in how records are laid out, not in the engine.
 
 pub mod format;
+pub mod late_search;
+pub mod late_store;
 pub mod search;
 pub mod store;

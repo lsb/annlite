@@ -100,6 +100,7 @@ pub fn measure(
     sql: &str,
     // Bound to the statement's LIMIT; SQLite reads -1 as "no limit".
     limit: i64,
+    split: crate::query::TermSplit,
     page_size: u64,
     table_map: Option<&(Vec<u16>, Vec<String>)>,
 ) -> Result<Vec<PageOutcome>> {
@@ -107,7 +108,7 @@ pub fn measure(
     let mut stmt = conn.prepare(sql)?;
     let mut out = Vec::with_capacity(queries.len());
     for q in queries {
-        let Some(expr) = crate::query::match_expression(&q.text) else { continue };
+        let Some(expr) = crate::query::match_expression_with(&q.text, split) else { continue };
         conn.execute_batch("PRAGMA shrink_memory")?;
         let _ = db::take_cache_miss(&conn);
         vfs::record_start();
@@ -154,12 +155,13 @@ pub fn measure_fresh_connection(
     queries: &[crate::query::Query],
     sql: &str,
     limit: i64,
+    split: crate::query::TermSplit,
     page_size: u64,
     sample: usize,
 ) -> Result<Vec<usize>> {
     let mut out = Vec::new();
     for q in queries.iter().take(sample) {
-        let Some(expr) = crate::query::match_expression(&q.text) else { continue };
+        let Some(expr) = crate::query::match_expression_with(&q.text, split) else { continue };
         vfs::record_start();
         {
             let conn = open_counting(db_path)?;

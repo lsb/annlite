@@ -10,7 +10,7 @@
 //! process-global (a VFS is), so two tests recording at the same time would interleave
 //! their reads.
 
-use annlite_fts5::{db, index, pages, query, vfs};
+use annlite_fts5::{db, index, pages, query, vfs, CorpusFormat};
 use rusqlite::Connection;
 use std::io::Write;
 
@@ -34,7 +34,7 @@ fn build_query_and_page_counting() {
         writeln!(f, "kappa lambda mu nu").unwrap();
     }
 
-    let report = index::build(&dbp, &corpus, true).unwrap();
+    let report = index::build(&dbp, &corpus, CorpusFormat::Words, true).unwrap();
     assert_eq!(report.n_docs, 4);
     assert!(report.stats.page_count > 0);
     assert_eq!(report.stats.page_size, db::PAGE_SIZE);
@@ -77,7 +77,10 @@ fn build_query_and_page_counting() {
         let pc: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
         db::page_table_map(&c, pc as u64).unwrap()
     };
-    let measured = pages::measure(&dbp, &queries, &sql, 10, page_size, Some(&map)).unwrap();
+    let measured = pages::measure(
+        &dbp, &queries, &sql, 10, query::TermSplit::Whitespace, page_size, Some(&map),
+    )
+    .unwrap();
     assert_eq!(measured.len(), 2);
     let total_pages = report.stats.page_count as usize;
     for m in &measured {

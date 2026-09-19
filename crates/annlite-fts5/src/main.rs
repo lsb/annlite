@@ -1,9 +1,13 @@
-//! Runs the FTS5 baseline at one corpus scale and writes JSONL results.
+//! Runs the FTS5 baseline over one corpus and writes JSONL results.
 //!
-//! Scale is a CLI argument rather than a loop over all three because the 1M-document
-//! run takes minutes and should be startable, interruptible and re-runnable on its own.
+//! The corpus is a CLI argument rather than a loop over all of them because the
+//! 1M-document run takes minutes and should be startable, interruptible and
+//! re-runnable on its own. It is named either by one of the generated scales or by an
+//! explicit pair of files, and the two differ only in how [`Corpus`] is filled in --
+//! the build, optimize and vacuum phases, the pass-through page counter and its
+//! cache-miss cross-check are one code path for both.
 
-use annlite_fts5::{db, index, metrics, pages, query, scale_by_name};
+use annlite_fts5::{db, index, metrics, pages, query, scale_by_name, Corpus, CorpusFormat};
 use anyhow::{Context, Result};
 use clap::Parser;
 use metrics::Dist;
@@ -17,9 +21,25 @@ use std::time::Instant;
 #[derive(Parser)]
 #[command(name = "annlite-fts5", about = "FTS5 baseline: build, latency, quality, page access")]
 struct Cli {
-    /// Corpus scale: 100, 10k or 1m.
+    /// Corpus scale: 100, 10k or 1m. Shorthand for the generated word corpora; give
+    /// `--docs`/`--queries` instead for any other collection.
+    #[arg(long, conflicts_with_all = ["docs", "queries"])]
+    scale: Option<String>,
+    /// One document per line. Requires `--queries` and `--name`.
+    #[arg(long, requires_all = ["queries", "name"])]
+    docs: Option<PathBuf>,
+    /// JSONL query set: `qid`, `kind`, `text` and, for a query with a gold answer,
+    /// `source_doc`.
+    #[arg(long, requires_all = ["docs", "name"])]
+    queries: Option<PathBuf>,
+    /// Label for the database and results files of a `--docs` run.
     #[arg(long)]
-    scale: String,
+    name: Option<String>,
+    /// Corpus conventions: `words` (literal lines, whitespace-separated terms) or
+    /// `code` (backslash-escaped lines, prose queries split on non-alphanumerics).
+    /// Defaults to `words` for `--scale` and `code` for `--docs`.
+    #[arg(long)]
+    corpus_format: Option<String>,
     #[arg(long, default_value = "data")]
     data_dir: PathBuf,
     #[arg(long, default_value = "bench/results")]
@@ -60,8 +80,10 @@ struct LatencyOutcome {
 #[derive(Clone, Debug)]
 struct QualityOutcome {
     qid: usize,
-    kind: String,
     k: usize,
+    /// Whether this query has a gold document at all; only those count toward
+    /// known-item quality.
+    has_gold: bool,
     /// 1-based rank of the gold document, if it appeared within `limit`.
     rank: Option<usize>,
     /// Total documents matching the query, independent of `limit`.
@@ -95,11 +117,16 @@ fn sql_unranked() -> String {
     format!("SELECT rowid FROM {t} WHERE {t} MATCH ?1 LIMIT ?2")
 }
 
-fn run_latency(conn: &Connection, queries: &[query::Query], limit: usize) -> Result<Vec<LatencyOutcome>> {
+fn run_latency(
+    conn: &Connection,
+    queries: &[query::Query],
+    limit: usize,
+    split: query::TermSplit,
+) -> Result<Vec<LatencyOutcome>> {
     let mut stmt = conn.prepare(&sql_for(true))?;
     let mut out = Vec::with_capacity(queries.len());
     for q in queries {
-        let Some(expr) = query::match_expression(&q.text) else { continue };
+        let Some(expr) = query::match_expression_with(&q.text, split) else { continue };
         let t0 = Instant::now();
         let mut rows = stmt.query(rusqlite::params![expr, limit as i64])?;
         let mut n = 0usize;
@@ -114,12 +141,17 @@ fn run_latency(conn: &Connection, queries: &[query::Query], limit: usize) -> Res
     Ok(out)
 }
 
-fn run_quality(conn: &Connection, queries: &[query::Query], limit: usize) -> Result<Vec<QualityOutcome>> {
+fn run_quality(
+    conn: &Connection,
+    queries: &[query::Query],
+    limit: usize,
+    split: query::TermSplit,
+) -> Result<Vec<QualityOutcome>> {
     let mut top = conn.prepare(&sql_for(true))?;
     let mut count = conn.prepare(&sql_for(false))?;
     let mut out = Vec::with_capacity(queries.len());
     for q in queries {
-        let Some(expr) = query::match_expression(&q.text) else { continue };
+        let Some(expr) = query::match_expression_with(&q.text, split) else { continue };
         let mut rank = None;
         let mut best_score = None;
         let mut tied = 0usize;
@@ -145,8 +177,8 @@ fn run_quality(conn: &Connection, queries: &[query::Query], limit: usize) -> Res
         let match_count: i64 = count.query_row(rusqlite::params![expr], |r| r.get(0))?;
         out.push(QualityOutcome {
             qid: q.qid,
-            kind: q.kind.clone(),
             k: q.k,
+            has_gold: q.is_known_item(),
             rank,
             match_count,
             best_score,
@@ -157,18 +189,27 @@ fn run_quality(conn: &Connection, queries: &[query::Query], limit: usize) -> Res
 }
 
 /// Group label used in the summary records: overall, per kind, and per (kind, k).
+///
+/// The kinds are read off the query set rather than hard-coded, because they are a
+/// property of whichever generator produced it -- `known_item`/`random` for the word
+/// corpora, `docstring` for the code corpus.
 fn groups(queries: &[query::Query]) -> Vec<(String, Box<dyn Fn(&str, usize) -> bool>)> {
     let mut ks: Vec<usize> = queries.iter().map(|q| q.k).collect();
     ks.sort_unstable();
     ks.dedup();
+    let mut kinds: Vec<String> = queries.iter().map(|q| q.kind.clone()).collect();
+    kinds.sort();
+    kinds.dedup();
     let mut g: Vec<(String, Box<dyn Fn(&str, usize) -> bool>)> =
         vec![("all".to_string(), Box::new(|_, _| true))];
-    for kind in ["known_item", "random"] {
-        g.push((format!("kind={kind}"), Box::new(move |kk: &str, _| kk == kind)));
+    for kind in kinds {
+        let owned = kind.clone();
+        g.push((format!("kind={kind}"), Box::new(move |kk: &str, _| kk == owned)));
         for k in ks.clone() {
+            let owned = kind.clone();
             g.push((
                 format!("kind={kind},k={k}"),
-                Box::new(move |kk: &str, qk: usize| kk == kind && qk == k),
+                Box::new(move |kk: &str, qk: usize| kk == owned && qk == k),
             ));
         }
     }
@@ -195,18 +236,31 @@ fn fmt_dist(label: &str, d: &Dist, unit: &str) -> String {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let scale = scale_by_name(&cli.scale)
-        .with_context(|| format!("unknown scale {:?}; expected one of 100, 10k, 1m", cli.scale))?;
-
-    let corpus = cli.data_dir.join(format!("corpus/docs-{}.txt", scale.name));
-    let qpath = cli.data_dir.join(format!("corpus/queries-{}.jsonl", scale.name));
-    let manifest = cli.data_dir.join(format!("corpus/docs-{}.manifest.json", scale.name));
-    let db_path = cli.data_dir.join(format!("db/fts5-{}.db", scale.name));
+    let mut corpus = match (&cli.scale, &cli.docs, &cli.queries, &cli.name) {
+        (Some(s), _, _, _) => {
+            let scale = scale_by_name(s)
+                .with_context(|| format!("unknown scale {s:?}; expected one of 100, 10k, 1m"))?;
+            Corpus::scale(scale, &cli.data_dir)
+        }
+        (None, Some(d), Some(q), Some(n)) => {
+            Corpus::files(n, d.clone(), q.clone(), &cli.data_dir)
+        }
+        _ => anyhow::bail!(
+            "give either --scale <100|10k|1m> or --docs PATH --queries PATH --name LABEL"
+        ),
+    };
+    if let Some(f) = &cli.corpus_format {
+        corpus.format = CorpusFormat::parse(f)
+            .with_context(|| format!("unknown corpus format {f:?}; expected words or code"))?;
+    }
+    let split = corpus.format.term_split();
+    let scale_name = corpus.name.clone();
+    let db_path = corpus.db.clone();
     std::fs::create_dir_all(&cli.out_dir)?;
-    let out_path = cli.out_dir.join(format!("fts5-{}.jsonl", scale.name));
+    let out_path = cli.out_dir.join(format!("fts5-{}.jsonl", corpus.name));
     let mut out = Out { file: std::io::BufWriter::new(std::fs::File::create(&out_path)?) };
 
-    let mut queries = query::load(&qpath)?;
+    let mut queries = query::load(&corpus.queries)?;
     if let Some(n) = cli.sample {
         queries.truncate(n);
     }
@@ -214,38 +268,41 @@ fn main() -> Result<()> {
 
     // ---- build -----------------------------------------------------------------
     let build = if cli.reuse_db {
-        eprintln!("[{}] reusing existing database {}", scale.name, db_path.display());
+        eprintln!("[{}] reusing existing database {}", scale_name, db_path.display());
         None
     } else {
-        eprintln!("[{}] building FTS5 index from {}", scale.name, corpus.display());
-        Some(index::build(&db_path, &corpus, with_dbstat)?)
+        eprintln!("[{}] building FTS5 index from {}", scale_name, corpus.docs.display());
+        Some(index::build(&db_path, &corpus.docs, corpus.format, with_dbstat)?)
     };
 
     let conn = Connection::open(&db_path)?;
     db::assert_fts5(&conn)?;
     let meta = json!({
         "record": "meta",
-        "scale": scale.name,
-        "n_docs_expected": scale.n_docs,
+        "scale": scale_name,
+        "n_docs_expected": corpus.n_docs_expected,
         "timestamp_utc": db::utc_now(&conn)?,
         "sqlite_version": db::sqlite_version(&conn)?,
         "page_size": db::PAGE_SIZE,
         "result_limit": cli.limit,
         "n_queries": queries.len(),
-        "corpus": corpus.display().to_string(),
-        "corpus_manifest": std::fs::read_to_string(&manifest).ok()
+        "corpus": corpus.docs.display().to_string(),
+        "query_set": corpus.queries.display().to_string(),
+        "corpus_format": format!("{:?}", corpus.format).to_lowercase(),
+        "corpus_manifest": std::fs::read_to_string(&corpus.manifest).ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
         "db_path": db_path.display().to_string(),
         "fts5_table": format!("CREATE VIRTUAL TABLE {} USING fts5(body)", index::TABLE),
         "match_expression": "terms OR-ed, each double-quoted; ORDER BY bm25() ASC",
+        "term_split": format!("{split:?}").to_lowercase(),
     });
     out.write(meta.clone())?;
-    println!("== FTS5 baseline, scale {} ==", scale.name);
+    println!("== FTS5 baseline, corpus {} ==", scale_name);
     println!("sqlite {}  page_size {}  queries {}  limit {}",
         db::sqlite_version(&conn)?, db::PAGE_SIZE, queries.len(), cli.limit);
 
     if let Some(b) = &build {
-        out.write(json!({ "record": "build", "scale": scale.name, "build": b }))?;
+        out.write(json!({ "record": "build", "scale": scale_name, "build": b }))?;
         println!(
             "\nbuild: {} docs in {:.2}s = {:.0} docs/s ({:.1} MiB/s of corpus text)",
             b.n_docs, b.build_secs, b.docs_per_sec, b.mib_per_sec
@@ -273,9 +330,13 @@ fn main() -> Result<()> {
         // Warm the pager cache first so the timed pass measures steady-state query
         // cost rather than the first-touch cost of the index; the cold-cache cost is
         // what the page-access phase below reports, in pages rather than in seconds.
-        let _ = run_latency(&conn, &queries, cli.limit)?;
-        let lat = run_latency(&conn, &queries, cli.limit)?;
-        let qual = run_quality(&conn, &queries, cli.limit)?;
+        let _ = run_latency(&conn, &queries, cli.limit, split)?;
+        // CPU rather than wall clock: this machine runs other benchmarks, and the
+        // wall-clock figures move by more than 2x with background load. See cpu.rs.
+        let cpu0 = annlite_fts5::cpu::process_cpu_nanos();
+        let lat = run_latency(&conn, &queries, cli.limit, split)?;
+        let cpu_ms = annlite_fts5::cpu::since_ms(cpu0);
+        let qual = run_quality(&conn, &queries, cli.limit, split)?;
         drop(conn);
 
         println!("\n-- {phase}: query latency (warm cache, µs) --");
@@ -287,13 +348,26 @@ fn main() -> Result<()> {
             let d = Dist::of(&v);
             let res: Vec<f64> = lat.iter().filter(|o| pred(&o.kind, o.k)).map(|o| o.n_results as f64).collect();
             out.write(json!({
-                "record": "latency", "scale": scale.name, "phase": phase,
+                "record": "latency", "scale": scale_name, "phase": phase,
                 "group": label, "latency_us": d, "n_results": Dist::of(&res),
             }))?;
             println!("{}", fmt_dist(&label, &d, "µs"));
         }
+        if let Some(ms) = cpu_ms {
+            out.write(json!({
+                "record": "cpu", "scale": scale_name, "phase": phase,
+                "n_queries": lat.len(),
+                "cpu_ms_total": ms, "cpu_ms_per_query": ms / lat.len().max(1) as f64,
+                "note": "process CPU time over the timed pass; the machine is shared, so \
+                         even this is an upper bound rather than a clean measurement",
+            }))?;
+            println!("cpu: {:.3} ms/query over {} queries (shared machine)",
+                ms / lat.len().max(1) as f64, lat.len());
+        }
 
-        let ki: Vec<&QualityOutcome> = qual.iter().filter(|q| q.kind == "known_item").collect();
+        // Known-item quality is scored over the queries that have a gold document,
+        // whatever the generator called their kind.
+        let ki: Vec<&QualityOutcome> = qual.iter().filter(|q| q.has_gold).collect();
         let ranks: Vec<Option<usize>> = ki.iter().map(|q| q.rank).collect();
         let overall = metrics::known_item_quality(&ranks);
         let mut per_k = serde_json::Map::new();
@@ -313,7 +387,7 @@ fn main() -> Result<()> {
                 }),
             );
         }
-        let rnd: Vec<&QualityOutcome> = qual.iter().filter(|q| q.kind == "random").collect();
+        let rnd: Vec<&QualityOutcome> = qual.iter().filter(|q| !q.has_gold).collect();
         let rnd_counts: Vec<f64> = rnd.iter().map(|q| q.match_count as f64).collect();
         let rnd_scores: Vec<f64> = rnd.iter().filter_map(|q| q.best_score).collect();
         let rnd_zero = rnd.iter().filter(|q| q.match_count == 0).count();
@@ -331,7 +405,7 @@ fn main() -> Result<()> {
             );
         }
         out.write(json!({
-            "record": "quality", "scale": scale.name, "phase": phase,
+            "record": "quality", "scale": scale_name, "phase": phase,
             "known_item": { "overall": overall, "per_k": per_k },
             "random": {
                 "n_queries": rnd.len(),
@@ -360,10 +434,12 @@ fn main() -> Result<()> {
         println!("overall success@1/@10/@100 = {:.3} / {:.3} / {:.3}   MRR@100 = {:.4}   never retrieved: {}",
             overall.success_at[0].1, overall.success_at[1].1, overall.success_at[2].1,
             overall.mrr_at[2].1, overall.n_unretrieved);
-        println!("\n-- {phase}: random queries --");
-        println!("{}", fmt_dist("match_count", &Dist::of(&rnd_counts), "docs"));
-        println!("{}", fmt_dist("best bm25", &Dist::of(&rnd_scores), ""));
-        println!("zero-result random queries: {} / {}", rnd_zero, rnd.len());
+        if !rnd.is_empty() {
+            println!("\n-- {phase}: queries with no gold document --");
+            println!("{}", fmt_dist("match_count", &Dist::of(&rnd_counts), "docs"));
+            println!("{}", fmt_dist("best bm25", &Dist::of(&rnd_scores), ""));
+            println!("zero-result queries: {} / {}", rnd_zero, rnd.len());
+        }
 
         // ---- page access --------------------------------------------------------
         let base = pages::open_prepare_baseline(&db_path, &sql_for(true))?;
@@ -375,9 +451,11 @@ fn main() -> Result<()> {
             if with_dbstat { Some(db::page_table_map(&c, pc as u64)?) } else { None }
         };
         let po = pages::measure(
-            &db_path, &queries, &sql_for(true), cli.limit as i64, db::PAGE_SIZE as u64, table_map.as_ref())?;
+            &db_path, &queries, &sql_for(true), cli.limit as i64, split,
+            db::PAGE_SIZE as u64, table_map.as_ref())?;
         let cross = pages::measure_fresh_connection(
-            &db_path, &queries, &sql_for(true), cli.limit as i64, db::PAGE_SIZE as u64, cli.crosscheck,
+            &db_path, &queries, &sql_for(true), cli.limit as i64, split,
+            db::PAGE_SIZE as u64, cli.crosscheck,
         )?;
         println!("\n-- {phase}: pages touched per query (cold pager cache, 4 KiB pages) --");
         println!("connection open + prepare alone: {} distinct pages, {} xRead calls",
@@ -400,7 +478,7 @@ fn main() -> Result<()> {
                 }
             }
             out.write(json!({
-                "record": "pages", "scale": scale.name, "phase": phase, "group": label,
+                "record": "pages", "scale": scale_name, "phase": phase, "group": label,
                 "method": "xRead interception, PRAGMA shrink_memory before each query",
                 "distinct_pages": dp, "contiguous_runs": runs, "read_calls": rc,
                 "bytes_read": by, "cache_miss_dbstatus": cm,
@@ -418,7 +496,8 @@ fn main() -> Result<()> {
         // limit) so that both variants enumerate every candidate — a LIMIT without an
         // ORDER BY would stop early and understate the unranked cost.
         let unranked = pages::measure(
-            &db_path, &queries, &sql_unranked(), -1, db::PAGE_SIZE as u64, table_map.as_ref())?;
+            &db_path, &queries, &sql_unranked(), -1, split,
+            db::PAGE_SIZE as u64, table_map.as_ref())?;
         println!("\n-- {phase}: pages without ORDER BY bm25() (posting lists only) --");
         for (label, pred) in groups(&queries) {
             let sel: Vec<&pages::PageOutcome> = unranked.iter().filter(|o| pred(&o.kind, o.k)).collect();
@@ -436,7 +515,7 @@ fn main() -> Result<()> {
                 }
             }
             out.write(json!({
-                "record": "pages_unranked", "scale": scale.name, "phase": phase, "group": label,
+                "record": "pages_unranked", "scale": scale_name, "phase": phase, "group": label,
                 "sql": sql_unranked(), "distinct_pages": dp, "contiguous_runs": runs,
                 "mean_pages_by_table": tables,
                 "ranked_distinct_pages_mean": ranked.mean,
@@ -448,7 +527,7 @@ fn main() -> Result<()> {
         let agree = po.iter().filter(|o| o.cache_miss as usize == o.distinct_pages).count();
         let cross_d = Dist::of(&cross.iter().map(|&x| x as f64).collect::<Vec<_>>());
         out.write(json!({
-            "record": "pages_crosscheck", "scale": scale.name, "phase": phase,
+            "record": "pages_crosscheck", "scale": scale_name, "phase": phase,
             "open_prepare_pages": base.pages(db::PAGE_SIZE as u64).len(),
             "open_prepare_read_calls": base.read_calls(),
             "cache_miss_equals_distinct_pages": agree,
@@ -470,7 +549,7 @@ fn main() -> Result<()> {
             debug_assert_eq!(l.qid, q.qid, "latency and quality passes visited queries in different orders");
             let p = page_by_qid.get(&l.qid);
             out.write(json!({
-                "record": "query", "scale": scale.name, "phase": phase,
+                "record": "query", "scale": scale_name, "phase": phase,
                 "qid": l.qid, "kind": l.kind, "k": l.k,
                 "latency_us": l.latency_us, "n_results": l.n_results,
                 "match_count": q.match_count, "rank": q.rank,
@@ -490,13 +569,13 @@ fn main() -> Result<()> {
     run_phase("pre_optimize", &mut out)?;
 
     // ---- optimize ----------------------------------------------------------------
-    eprintln!("[{}] running FTS5 optimize", scale.name);
+    eprintln!("[{}] running FTS5 optimize", scale_name);
     let opt = index::optimize(&db_path, with_dbstat)?;
     let conn = Connection::open(&db_path)?;
     let segs_after = index::segment_count(&conn)?;
     drop(conn);
     out.write(json!({
-        "record": "optimize", "scale": scale.name,
+        "record": "optimize", "scale": scale_name,
         "optimize": opt, "segments_before": segs_before, "segments_after": segs_after,
     }))?;
     println!("\noptimize: {:.2}s, segments {} -> {}, db {} bytes / {} pages, freelist {}",
@@ -512,9 +591,9 @@ fn main() -> Result<()> {
 
     // ---- vacuum ------------------------------------------------------------------
     if !cli.skip_vacuum {
-        eprintln!("[{}] running VACUUM", scale.name);
+        eprintln!("[{}] running VACUUM", scale_name);
         let vac = index::vacuum(&db_path, with_dbstat)?;
-        out.write(json!({ "record": "vacuum", "scale": scale.name, "vacuum": vac }))?;
+        out.write(json!({ "record": "vacuum", "scale": scale_name, "vacuum": vac }))?;
         println!("\nvacuum: {:.2}s, db {} bytes / {} pages, freelist {}",
             vac.vacuum_secs, vac.stats.file_bytes, vac.stats.page_count, vac.stats.freelist_count);
         run_phase("post_vacuum", &mut out)?;

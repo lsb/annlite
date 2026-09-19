@@ -166,6 +166,40 @@ impl LateIndex {
         &self.codes[a..b]
     }
 
+    /// Documents containing centroid `c`, ascending. Stage 1's inverted list.
+    ///
+    /// Exposed because the SQLite form stores exactly these bytes and has to be
+    /// checkable against them; a posting list written under a different ordering
+    /// still returns plausible-looking candidates.
+    pub fn postings(&self, c: u32) -> &[u32] {
+        &self.postings[c as usize]
+    }
+
+    /// `offsets[i]..offsets[i + 1]` in token units. The directory a storage form
+    /// needs to find a variable-length document without a second lookup.
+    pub fn doc_offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    pub fn total_tokens(&self) -> usize {
+        self.codes.len()
+    }
+
+    /// Score every query token against every centroid: `tokens * k` entries.
+    ///
+    /// Both remaining stages read from this table and nothing else that is
+    /// query-dependent, which is what makes stages 1 and 2 free of per-candidate
+    /// lookups -- section 9.4's lesson, applied to late interaction.
+    pub fn query_centroid_table(&self, query: &MultiVector) -> Vec<f32> {
+        let mut qc = vec![0f32; query.tokens() * self.k];
+        for (i, q) in query.iter().enumerate() {
+            for c in 0..self.k {
+                qc[i * self.k + c] = dot(q, self.centroid(c as u32));
+            }
+        }
+        qc
+    }
+
     fn centroid(&self, c: u32) -> &[f32] {
         &self.centroids[c as usize * self.dim..(c as usize + 1) * self.dim]
     }
@@ -183,23 +217,12 @@ impl LateIndex {
     /// widens the candidate net at the cost of reading more postings.
     pub fn candidates(&self, query: &MultiVector, n_probe: usize, top: usize) -> Vec<(u32, f32)> {
         // Query-to-centroid scores, reused by both stages.
-        let mut qc = vec![0f32; query.tokens() * self.k];
-        for (i, q) in query.iter().enumerate() {
-            for c in 0..self.k {
-                qc[i * self.k + c] = dot(q, self.centroid(c as u32));
-            }
-        }
+        let qc = self.query_centroid_table(query);
 
         let mut seen = vec![false; self.len()];
         let mut cands: Vec<u32> = Vec::new();
         for i in 0..query.tokens() {
-            let row = &qc[i * self.k..(i + 1) * self.k];
-            let mut order: Vec<u32> = (0..self.k as u32).collect();
-            let probe = n_probe.min(self.k);
-            order.select_nth_unstable_by(probe - 1, |&a, &b| {
-                row[b as usize].total_cmp(&row[a as usize])
-            });
-            for &c in &order[..probe] {
+            for c in probe_centroids(&qc[i * self.k..(i + 1) * self.k], n_probe) {
                 for &d in &self.postings[c as usize] {
                     if !seen[d as usize] {
                         seen[d as usize] = true;
@@ -213,20 +236,7 @@ impl LateIndex {
         // document's centroid ids and the resident query-centroid table.
         let mut scored: Vec<(u32, f32)> = cands
             .into_iter()
-            .map(|d| {
-                let codes = self.doc_codes(d);
-                let s: f32 = (0..query.tokens())
-                    .map(|i| {
-                        let row = &qc[i * self.k..(i + 1) * self.k];
-                        codes
-                            .iter()
-                            .map(|&c| row[c as usize])
-                            .fold(f32::NEG_INFINITY, f32::max)
-                    })
-                    .filter(|s| s.is_finite())
-                    .sum();
-                (d, s)
-            })
+            .map(|d| (d, centroid_maxsim(&qc, self.k, query.tokens(), self.doc_codes(d))))
             .collect();
         scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(top);
@@ -256,6 +266,37 @@ impl LateIndex {
         cands.truncate(k);
         cands
     }
+}
+
+/// The `n_probe` centroids a single query token probes, best score first among the
+/// selected set but otherwise unordered.
+///
+/// Factored out rather than inlined because the SQLite storage form must select the
+/// *same* centroids as the in-memory index; two independently written selections
+/// that disagree only on ties would produce two candidate pools that are almost the
+/// same, which is the kind of difference a quality number hides rather than reveals.
+pub fn probe_centroids(row: &[f32], n_probe: usize) -> Vec<u32> {
+    let k = row.len();
+    let probe = n_probe.clamp(1, k);
+    let mut order: Vec<u32> = (0..k as u32).collect();
+    order.select_nth_unstable_by(probe - 1, |&a, &b| row[b as usize].total_cmp(&row[a as usize]));
+    order.truncate(probe);
+    order
+}
+
+/// Stage 2's score: MaxSim with every document token replaced by its centroid.
+///
+/// `qc` is the `tokens * k` table from [`LateIndex::query_centroid_table`]. The
+/// document contributes only its centroid ids, which is the entire point -- four
+/// bytes per token instead of `dim * 4`.
+pub fn centroid_maxsim(qc: &[f32], k: usize, tokens: usize, codes: &[u32]) -> f32 {
+    (0..tokens)
+        .map(|i| {
+            let row = &qc[i * k..(i + 1) * k];
+            codes.iter().map(|&c| row[c as usize]).fold(f32::NEG_INFINITY, f32::max)
+        })
+        .filter(|s| s.is_finite())
+        .sum()
 }
 
 /// Nearest centroid for every vector in `pool`.

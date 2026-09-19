@@ -8,11 +8,15 @@ description = "SQLite storage format for annlite vector indexes, laid out for pa
 
 [dependencies]
 annlite-core = { path = "../annlite-core" }
+# For `metrics` and `cpu`, not for FTS5. A quality comparison only means something if
+# both sides compute success@k the same way, so the arithmetic is shared rather than
+# reimplemented -- see the module doc on annlite-fts5::metrics.
+annlite-fts5 = { path = "../annlite-fts5" }
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "blob"] }
 
 [dev-dependencies]
 rand.workspace = true

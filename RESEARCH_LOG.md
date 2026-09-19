@@ -1063,17 +1063,37 @@ exact rescoring of a 100-document pool.
 | **1,024** | **646** | **43.7x** | 0.240 | 0.578 | **0.454** | 48 s |
 | 2,048 | 705 | 40.0x | 0.302 | 0.630 | **0.454** | 97 s |
 
-At 1,024 centroids the index is **43.7x smaller while matching exact quality to three
-decimals** — 0.454 against 0.454. Doubling the centroid count to 2,048 buys a better
-*first-stage* ranking (cand@1 climbs 0.240 to 0.302) but nothing after reranking,
-which is the expected shape: the first stage only has to get the right document into
-the pool, and by 1,024 centroids it already does. 512 centroids is where that stops
-being true, and rerank@1 slips to 0.444.
+At 1,024 centroids the *centroid representation* is **43.7x smaller** than the raw
+token vectors, and reranking a pool against exact vectors recovers exact quality to
+three decimals. Doubling to 2,048 centroids buys a better *first-stage* ranking
+(cand@1 climbs 0.240 to 0.302) but nothing after reranking: the first stage only has
+to get the right document into the pool, and by 1,024 it already does.
 
-This is what makes late interaction storable. 28.2 KB per document extrapolates to
-28 GB at a million documents; 646 bytes extrapolates to **646 MB**, the same order as
-the FTS5 baseline's 730 MB, and therefore in the range a real deployment can
-consider.
+**But the compression figure and the quality figure describe different
+configurations, and pairing them overstates the system.** `footprint()` counts the
+centroid codes and the centroid table — exactly what PLAID compresses — and nothing
+else. A file that can actually *answer* a query carries the inverted lists and an
+offsets directory too, and a configuration that reranks exactly must also store the
+uncompressed token vectors it reranks against. Measured from `dbstat` on the stored
+databases (section 15.4):
+
+| k = 1,024 configuration | success@1 | bytes/doc, as stored | index |
+|---|---:|---:|---:|
+| centroid stages only, no rerank | **0.240** | 928 | 3.1 MB |
+| with exact rerank of 100 | **0.454** | **29,196** | 98.3 MB |
+
+So this implementation is either cheap and weak or strong and expensive, with nothing
+in between. The missing piece is **residual quantization**: real ColBERTv2/PLAID
+stores a few bits of residual per token so that reranking happens in the compressed
+domain, which is what would make an accurate configuration also a small one. Sections
+12 and 15.2 implement PLAID's *staging* and its centroid compression; they do not
+implement its residuals, and the 43.7x figure should be read as applying to the
+candidate-generation data alone.
+
+Extrapolated to a million documents: the no-rerank configuration is ~928 MB, the same
+order as the FTS5 baseline's 730 MB; the exact-rerank configuration is ~29 GB, which
+is not deployable. Closing that gap is the single most valuable follow-up in the
+project.
 
 *Cross-check.* Exact MaxSim was computed independently in Python and in Rust, on the
 same embeddings, and agrees to three decimals: 0.454 success@1 and 0.780 success@10
@@ -1108,6 +1128,120 @@ of 3,366. Selectivity would require a corpus large enough that a centroid appear
 a small fraction of documents — which, at 145 tokens per document, means `k` far
 above the document count. This corpus cannot show that, and the honest reading is
 that the candidate-generation stage is untested here rather than that it is useless.
+
+### 15.4 Late interaction in SQLite, with page accounting
+
+Sections 15.1 and 15.2 measured quality and size. Both were measured in memory, so
+neither said anything about the axis this project is about. This section stores the
+`LateIndex` in an ordinary SQLite file and reports what a client holding no copy of
+that file pays, per stage, so late interaction can be set beside FTS5 and the dense
+index on the same terms.
+
+**The storage problem, and the trade made.** The Vamana format gets its page
+arithmetic free: fixed-size records, so node `i` is at byte `i * record_bytes`
+(section 11.3). A late-interaction document is a list of one centroid id per token,
+and on this corpus that is a mean of 147 and a maximum of 830 — there is no record
+size that is both correct and predictable. Three options were weighed:
+
+| option | cost | verdict |
+|---|---|---|
+| offsets **table**, looked up per candidate | one extra *dependent* round-trip per candidate | rejected: this is FTS5's `%_docsize` pattern, the 79x penalty of section 9.4 |
+| pad to a fixed size | 5.64x to the corpus maximum; 2.00x with four quantile buckets; 1.22x with sixteen | rejected: gives back most of PLAID's 43.7x |
+| **contiguous arena + resident offsets directory** | **1.007x** (4 bytes per document) plus a one-time preload | **chosen** |
+
+So each variable-length collection is one BLOB — an arena — holding every document's
+data end to end in document order, with an `n + 1` entry `u32` offsets directory
+carried in the metadata a client downloads once. Document `i` is the byte range
+`[off[i] * 4, off[i+1] * 4)`, and the pages covering it follow by the same
+arithmetic a fixed record would use. The directory is 13 KB here, 0.7% of the arena
+it indexes, and 4 MB at a million documents. Three arenas — postings, centroid codes,
+exact token vectors — one per stage, so the stages cannot share a page and their
+costs cannot be confused. Reads go through `sqlite3_blob_open` at a byte offset:
+core SQLite, present in a stock WASM build, no virtual table and no extension.
+
+SQLite allocates an oversized BLOB's overflow pages consecutively within one insert,
+so a byte range is a *run* of consecutive pages. That is asserted rather than
+assumed: the arena's real page numbers are read out of `dbstat` at open, checked
+against the local/overflow split, and a test fails if the chain is not consecutive.
+
+**Measured, 3,366 documents, 500 queries, page size 4096.** Mean per query.
+
+| k | probe | rerank | succ@1 | succ@10 | MRR@10 | pages | requests | hops | bytes/doc | build |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 8 | 0 | 0.140 | 0.450 | 0.229 | 585 | 33 | 2 | 852 | 22.5 s |
+| 512 | 8 | 100 | 0.444 | 0.716 | 0.540 | 1,806 | 129 | 3 | 29,120 | 22.5 s |
+| 1,024 | 4 | 0 | 0.240 | 0.578 | 0.343 | 550 | 33 | 2 | 928 | 44.9 s |
+| **1,024** | **4** | **100** | **0.454** | **0.760** | **0.563** | **1,749** | **130** | **3** | 29,196 | 44.9 s |
+| 1,024 | 8 | 0 | 0.240 | 0.578 | 0.343 | 592 | 42 | 2 | 928 | 44.9 s |
+| 1,024 | 8 | 100 | 0.454 | 0.760 | 0.563 | 1,791 | 139 | 3 | 29,196 | 44.9 s |
+| 1,024 | 32 | 0 | 0.242 | 0.580 | 0.344 | 680 | 25 | 2 | 928 | 44.9 s |
+| 1,024 | 32 | 100 | 0.454 | 0.760 | 0.563 | 1,878 | 122 | 3 | 29,196 | 44.9 s |
+| 2,048 | 8 | 0 | 0.304 | 0.630 | 0.406 | 589 | 49 | 2 | 1,025 | 89.2 s |
+| 2,048 | 8 | 100 | 0.454 | 0.774 | 0.565 | 1,771 | 146 | 3 | 29,293 | 89.2 s |
+
+Quality reproduces section 15.2 out of the database to three decimals — 0.444 at
+512 centroids, 0.454 at 1,024 and 2,048, against the exact-MaxSim ceiling of 0.454 —
+which is the check that the stored form is the index and not something adjacent to
+it. Against the attainable ceiling of 0.962 (section 15.1), 0.454 is 0.472.
+
+**Per stage.** Mean per query, probe 8.
+
+| k | rerank | stage | pages | requests | payload | arena |
+|---:|---:|---|---:|---:|---:|---:|
+| 1,024 | 100 | postings | 108.1 | 39.8 | 175 KB | 226 pg |
+| 1,024 | 100 | centroid | **484.0** | **2.0** | 1.98 MB | **484 pg** |
+| 1,024 | 100 | rerank | **1,198.7** | **97.0** | 4.51 MB | 23,230 pg |
+
+Three findings, in order of how much they matter.
+
+*Reranking is the expensive stage, as it was for the dense index.* It is **67% of
+the pages and 70% of the requests**, and nearly all of the bytes: 4.5 MB against the
+other two stages' 2.2 MB combined. Its 97 requests for 100 documents is the worst
+ratio in the table — the pool is in score order, not id order, so essentially every
+reranked document is its own range request. This is the same shape as section 11.5,
+where full vectors dominated a traversal that had already been made cheap, and for
+the same reason: the pool is scattered by construction.
+
+*The centroid stage is a full scan, and should therefore be resident.* Stage 2
+touches **484 of the code arena's 484 pages** on every query, because stage 1's
+candidate pool is **100.0% of the corpus** — the arithmetic of section 15.3, now
+measured in pages. But it touches them in **2 requests**, because they are one
+contiguous run. A client that fetches the 1.98 MB arena once per session pays that
+twice and gets every later query's stage 2 for nothing, which is exactly the
+resident-codes trade of section 11.5 and is strictly better here than it is there, since the
+"traversal" reads the whole thing anyway.
+
+*Wider probing costs bytes and saves round-trips.* From probe 4 to 32 at k=1,024,
+postings pages go 66 → 196 but requests go **33 → 25**: more of the postings arena is
+read, and the spans coalesce into fewer runs. Section 15.3 found probe width does
+nothing for quality at this scale; it is not neutral for cost, and the sign is the
+opposite of the obvious guess.
+
+**What `bytes_per_doc` means here, and why it is not 646.** Section 15.2's 646 bytes
+counts `codes * 4 + centroids * 4`. A file that can actually answer a query also
+needs the inverted lists and the offsets directory, and pays SQLite's page rounding:
+**928 bytes per document** at 1,024 centroids without reranking. With reranking it
+needs the exact token vectors too, and the figure is **29,196** — the compression is
+in the *first two stages only*, and a configuration that reranks exactly is storing
+the uncompressed corpus whatever the index costs. That is the honest statement of
+what PLAID buys and does not buy, and it is the thing the 43.7x headline hides.
+
+**Hops are 2 or 3, flat.** There is no graph to walk: stage 1 knows every range it
+wants once the resident centroid table is scored, stage 2 once stage 1 returns,
+stage 3 once stage 2 sorts. The dense traversal pays eight or more dependent rounds
+at 10,000 documents. This is the structural advantage late interaction has over a
+graph index on a high-latency link, and it does not degrade with corpus size.
+
+*Timing.* `cpu_ms_per_query` is 24 ms without reranking and 61 ms with, taken from
+`/proc/self/stat` rather than the wall clock because the machine was shared; the
+records carry `contended: true`. Pages, requests, bytes and quality are unaffected by
+load. Build times are wall clock and did move: the same k-means that took 89 s here
+is quoted at 97 s in section 15.2.
+
+*Not measured.* The obvious next lever is capping the candidate pool before stage 2
+rather than scoring all 3,366; that changes the algorithm whose quality sections 15.1
+and 15.2 published, so it was left out rather than mixed in. Results are in
+`bench/results/tri-late.jsonl`.
 
 ---
 

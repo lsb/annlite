@@ -80,8 +80,25 @@ pub struct SearchCost {
     /// Full vectors fetched to rerank.
     pub vectors_read: usize,
     pub rerank_pages: usize,
+    /// Maximal runs of consecutive *vector* pages. Reranking reads a different table
+    /// from a candidate list that is in score order, not id order, so its reads are
+    /// scattered and must be counted as their own request run rather than folded into
+    /// the traversal's.
+    pub rerank_runs: usize,
     /// Maximal runs of consecutive node pages; see [`SearchCost::contiguous_runs_estimate`].
     pub contiguous_runs: usize,
+}
+
+/// Distinct pages and the number of maximal runs of consecutive ones.
+///
+/// The pair is the span a client's round-trip count lies in: one request per page if
+/// it fetches pages, one per run if it coalesces neighbours into a range.
+fn pages_and_runs(pages: HashSet<usize>) -> (usize, usize) {
+    let mut sorted: Vec<usize> = pages.into_iter().collect();
+    sorted.sort_unstable();
+    let runs = sorted.windows(2).filter(|w| w[1] != w[0] + 1).count()
+        + usize::from(!sorted.is_empty());
+    (sorted.len(), runs)
 }
 
 /// All PQ codes held client-side, fetched once per session.
@@ -221,11 +238,7 @@ pub fn search(
             }
         }
     }
-    cost.distinct_pages = pages.len();
-    let mut sorted: Vec<usize> = pages.into_iter().collect();
-    sorted.sort_unstable();
-    cost.contiguous_runs = sorted.windows(2).filter(|w| w[1] != w[0] + 1).count()
-        + usize::from(!sorted.is_empty());
+    (cost.distinct_pages, cost.contiguous_runs) = pages_and_runs(pages);
 
     let mut results: Vec<(u32, f32)> = list.iter().map(|e| (e.0, e.1)).collect();
 
@@ -250,7 +263,7 @@ pub fn search(
                 .collect();
             rescored.push((id, annlite_core::vectors::dot(query, &v)));
         }
-        cost.rerank_pages = vpages.len();
+        (cost.rerank_pages, cost.rerank_runs) = pages_and_runs(vpages);
         rescored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         results = rescored;
     }
@@ -333,11 +346,7 @@ pub fn search_resident(
         list.truncate(l);
     }
 
-    cost.distinct_pages = pages.len();
-    let mut sorted: Vec<usize> = pages.into_iter().collect();
-    sorted.sort_unstable();
-    cost.contiguous_runs = sorted.windows(2).filter(|w| w[1] != w[0] + 1).count()
-        + usize::from(!sorted.is_empty());
+    (cost.distinct_pages, cost.contiguous_runs) = pages_and_runs(pages);
 
     let mut results: Vec<(u32, f32)> = list.iter().map(|e| (e.0, e.1)).collect();
     if rerank > 0 {
@@ -356,7 +365,7 @@ pub fn search_resident(
                 .collect();
             rescored.push((id, annlite_core::vectors::dot(query, &v)));
         }
-        cost.rerank_pages = vpages.len();
+        (cost.rerank_pages, cost.rerank_runs) = pages_and_runs(vpages);
         rescored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         results = rescored;
     }

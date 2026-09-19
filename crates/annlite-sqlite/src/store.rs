@@ -189,3 +189,21 @@ pub fn node_page_stats(conn: &Connection) -> Result<(usize, f64)> {
     let rows: i64 = conn.query_row("SELECT COUNT(*) FROM annlite_nodes", [], |r| r.get(0))?;
     Ok((pages as usize, if pages > 0 { rows as f64 / pages as f64 } else { 0.0 }))
 }
+
+/// Pages and payload bytes per table, from `dbstat`.
+///
+/// Reported because "index bytes" is ambiguous for this format and the ambiguity is
+/// worth several megabytes: `annlite_nodes` plus `annlite_codeblob` is what a
+/// traversal reads, while `annlite_vectors` exists only so a shallow pool can be
+/// rescored exactly. A comparison that quotes the file size without saying which is
+/// which is comparing a search structure against a search structure plus a document
+/// store.
+pub fn table_page_stats(conn: &Connection) -> Result<Vec<(String, u64, u64)>> {
+    let mut st = conn.prepare(
+        "SELECT name, count(*), sum(pgsize) FROM dbstat GROUP BY name ORDER BY 3 DESC",
+    )?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}

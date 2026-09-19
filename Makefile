@@ -32,6 +32,7 @@ help:
 	@echo " measurement"
 	@echo "  make fts5           FTS5 baseline at all scales"
 	@echo "  make code-eval      BM25 vs dense vs late interaction on the code corpus"
+	@echo "  make late-pages     late interaction in SQLite: pages, requests, hops per stage"
 	@echo "  make matrix         join every result into docs/RESULTS.md"
 	@echo ""
 	@echo " browser"
@@ -165,7 +166,7 @@ demo-serve:
 # A code model cannot be evaluated on bags of dictionary words, so this builds the
 # docstring-to-code benchmark from the local Python standard library. Ground truth
 # is the corpus construction itself: a docstring's own function.
-.PHONY: code-corpus code-eval
+.PHONY: code-corpus code-eval late-pages
 
 code-corpus: $(CORPUS)/code-docs.txt
 $(CORPUS)/code-docs.txt:
@@ -174,6 +175,15 @@ $(CORPUS)/code-docs.txt:
 code-eval: code-corpus
 	$(PYTHON) tools/analyze/code_eval.py $(or $(NQ),500)
 	$(CARGO) run --release -p annlite-core --example late_eval
+
+# Late interaction with page accounting, so it can be set against FTS5 and dense on
+# the axis the project is about rather than on quality alone. Needs the multi-vector
+# embeddings, which `code-eval` writes.
+late-pages: data/embeddings/code-late.f32
+	$(CARGO) run --release -p annlite-sqlite --example late_pages -- $(or $(NQ),500)
+
+data/embeddings/code-late.f32:
+	$(MAKE) code-eval
 
 # --- Reporting -------------------------------------------------------------
 # Joins the separate benchmark outputs and converts measured counts into seconds

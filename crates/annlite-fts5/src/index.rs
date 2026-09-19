@@ -1,6 +1,6 @@
 //! Building the FTS5 index from a corpus file.
 
-use crate::db;
+use crate::{db, CorpusFormat};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -55,14 +55,21 @@ pub struct BuildReport {
 /// Create the database and load `corpus` into an FTS5 table, one row per line.
 ///
 /// The row's `rowid` is the 0-based line number, which is the document id the query
-/// sets refer to, so retrieval results need no translation table.
+/// sets refer to, so retrieval results need no translation table. `format` decides
+/// whether that line is the document or an escaped encoding of it; see
+/// [`decode_line`].
 ///
 /// The load runs inside a single transaction. FTS5 buffers postings in memory and
 /// flushes a segment when that buffer fills; committing per row would instead force a
 /// segment per row and turn the load into a merge storm. Streaming the corpus line by
 /// line keeps peak memory independent of corpus size — at 1M documents the file is
 /// 454 MB and reading it whole would be a needless resident copy.
-pub fn build(db_path: &Path, corpus: &Path, with_dbstat: bool) -> Result<BuildReport> {
+pub fn build(
+    db_path: &Path,
+    corpus: &Path,
+    format: CorpusFormat,
+    with_dbstat: bool,
+) -> Result<BuildReport> {
     if db_path.exists() {
         std::fs::remove_file(db_path)?;
     }
@@ -97,7 +104,8 @@ pub fn build(db_path: &Path, corpus: &Path, with_dbstat: bool) -> Result<BuildRe
             if body.is_empty() {
                 continue;
             }
-            ins.execute(rusqlite::params![n_docs as i64, body])?;
+            let body = decode_line(body, format);
+            ins.execute(rusqlite::params![n_docs as i64, body.as_ref()])?;
             n_docs += 1;
             if n_docs % 100_000 == 0 {
                 eprintln!("  … {n_docs} documents inserted ({:.1}s)", t0.elapsed().as_secs_f64());
@@ -186,4 +194,24 @@ pub fn segment_count(conn: &Connection) -> Result<i64> {
         [],
         |r| r.get(0),
     )?)
+}
+
+/// One corpus line as the document it stands for.
+///
+/// The code corpus keeps a whole function on one line by writing `\n` for a newline
+/// and `\\` for a backslash, so indexing the line verbatim would feed FTS5 a stray
+/// `n` token at every line break and change every document's length — and BM25 is a
+/// function of document length.
+///
+/// The two replacements are applied in the same order as `unescape()` in
+/// `tools/analyze/code_eval.py` so that the Rust and Python measurements index
+/// byte-identical text. That order is deliberately copied rather than corrected: it
+/// is not a true inverse of the writer — source that literally contains a backslash
+/// followed by `n` comes back as a backslash followed by a newline — and fixing it
+/// here alone would make the two implementations disagree on those documents.
+pub fn decode_line(line: &str, format: CorpusFormat) -> std::borrow::Cow<'_, str> {
+    if !format.escaped_lines() || !line.contains('\\') {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    std::borrow::Cow::Owned(line.replace("\\n", "\n").replace("\\\\", "\\"))
 }

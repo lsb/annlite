@@ -67,6 +67,7 @@ name = "annlite-sqlite"
 version = "0.1.0"
 dependencies = [
  "annlite-core",
+ "annlite-fts5",
  "anyhow",
  "clap",
  "rand",
