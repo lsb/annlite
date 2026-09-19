@@ -113,7 +113,7 @@ def main() -> int:
 
     # --- dense ANN ---------------------------------------------------------
     w("## Dense ANN (Vamana + PQ)\n")
-    for scale in ("10k", "1m"):
+    for scale in ("10k", "100k", "1m"):
         recs = load_jsonl(RESULTS / f"ann-{scale}.jsonl")
         if not recs:
             continue
@@ -178,6 +178,8 @@ def main() -> int:
             acc_d = Access(hops=max(1, round(b["mean_hops"])),
                            requests=max(1, round(b.get("mean_contiguous_runs", 1))),
                            bytes_fetched=int(b["mean_distinct_pages"] * PAGE_BYTES))
+            w("Cheaper option in brackets. Per-query tables above exclude the preload;")
+            w("this one includes it, which is the comparison that decides the design.\n")
             w("| profile | " + " | ".join(f"{n} quer{'y' if n == 1 else 'ies'}"
                                           for n in (1, 10, 100, 1000)) + " |")
             w("|---|" + "---:|" * 4)
@@ -186,8 +188,13 @@ def main() -> int:
                 for n in (1, 10, 100, 1000):
                     sr = session_seconds(acc_r, p, n)
                     sd = session_seconds(acc_d, p, n)
-                    better = "resident" if sr < sd else "on-disk"
-                    cells.append(f"{fmt_seconds(min(sr, sd))} ({better})")
+                    if abs(sr - sd) < 1e-9:
+                        # `ideal` has neither latency nor transfer cost, so the two
+                        # are genuinely tied rather than one winning.
+                        cells.append(f"{fmt_seconds(sr)} (tie)")
+                    else:
+                        better = "resident" if sr < sd else "on-disk"
+                        cells.append(f"{fmt_seconds(min(sr, sd))} ({better})")
                 w(f"| `{p}` | " + " | ".join(cells) + " |")
             w("")
 
