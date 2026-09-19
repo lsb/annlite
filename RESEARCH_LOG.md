@@ -812,7 +812,95 @@ the `LateOn-Code-edge` tokenizer.**
 
 ---
 
-## 13. Open items
+## 13. The browser demo, and what the client does to page locality
+
+`web/demo` runs in a real browser against a SQLite file it holds no copy of. It is
+driven end to end under Playwright, and all four combinations of transport and code
+residency return **identical** result ids, which is the correctness signal worth
+having across three implementations of the same search (native, WASM synchronous,
+WASM resumable).
+
+Retrieval visibly works even on this corpus: "guitar music concert stage" returns
+documents containing *bassists*, *concertmaster*, *saxophones*, *amplifiers*,
+*auditoriums* and *guitars* — the encoder is finding topical structure inside bags
+of random dictionary words.
+
+### 13.1 The traversal API is a state machine, not a callback
+
+`sql.js-httpvfs` is asynchronous from the page, so the synchronous callback the
+native build uses only works inside a Web Worker. `SearchSession` instead hands out
+the ids it needs, waits to be given the bytes, and steps forward. Three things
+follow, and they are why it is the API the demo uses:
+
+* It works with any asynchronous source without the traversal knowing.
+* Each request is a **batch**, which a browser issues in parallel up to its
+  per-origin limit, so one round costs about one round-trip however wide the frontier.
+* The round-trip count stops being an estimate. `session.hops` is measured.
+
+### 13.2 Finding: the httpvfs client fetches the whole database anyway
+
+`sql.js-httpvfs` treats `requestChunkSize` as a **floor, not a cap**. Its speculative
+read heads double their request size — 4 KiB, 8, 16, 32, 64, 128, 256, 512 KiB,
+1 MiB, 2 MiB — until they have swallowed the file. Observed request sizes for a
+single query against the 5.9 MB demo database, from the simulator's log:
+
+```
+4096  8192  16384  32768  65536  131072  262144  524288  1048576  2097152  1671168
+```
+
+The first query pulls **about 5.2 MB in six requests**: effectively the entire
+database. `maxReadHeads` and `maxReadSpeed` exist but live inside its lazy file and
+are not reachable through the public `createDbWorker` config — passing them was
+tried and measured to change nothing.
+
+**Any amount of page-locality work in the index is invisible to such a client**,
+because it has already fetched everything before locality could matter. That is a
+finding about the client, not the index, and it would have silently invalidated the
+section 11.4 ordering results had they been measured through this path.
+
+### 13.3 Bounded ranges: 56x fewer bytes, 69x more requests
+
+So the demo also offers the transport the fixed-size record format was designed for.
+Record `i` begins at byte `i * record_bytes`, so a client can compute the offset and
+issue a bounded `Range` request, coalescing adjacent records into single requests.
+
+Traversal measured separately from result display, because the latter always goes
+through SQLite here and its read-ahead would otherwise swamp the comparison:
+
+| transport | codes | round-trips | records | traversal requests | traversal bytes |
+|---|---|---:|---:|---:|---:|
+| SQLite httpvfs | on-disk | 39 | 863 | 2 | 528.0 KB |
+| SQLite httpvfs | resident | 20 | 72 | 1 | 512.0 KB |
+| bounded Range | on-disk | 39 | 863 | 726 | 109.6 KB |
+| **bounded Range** | **resident** | **20** | **72** | **69** | **9.1 KB** |
+
+Bounded ranges with resident codes move **9.1 KB per query against SQLite's 512 KB,
+a 56x reduction** — in 69 requests rather than one.
+
+### 13.4 This does not resolve in favour of either side at this scale
+
+Applying the cost model: on the `lte` profile (70 ms RTT, 15 Mbit/s, six parallel
+connections), 69 requests spread over 20 dependent rounds cost roughly
+20 x 70 ms = **1.4 s**, while one 512 KB request costs 70 ms + 0.27 s = **0.34 s**.
+
+**At two thousand documents the naive client wins**, and by a factor of four. Fetching
+9.1 KB instead of 512 KB is worth nothing when the 9.1 KB arrives as 69 dependent
+round-trips on a link where a round-trip costs more than 130 KB of transfer.
+
+That is not an argument against the index design; it is a statement of where the
+design earns its keep. A 5.9 MB database can be swallowed whole, so nothing cleverer
+than swallowing it is needed. A database that cannot be swallowed is the case the
+whole project exists for, and it is what the million-document scale measures — at
+which point section 9.3's figure for FTS5 (689 pages and 2.8 MB for a *single term*)
+is the thing to beat, and "just download it" is not available at roughly a gigabyte.
+
+The honest summary of the demo is therefore: it proves the machinery works
+end to end in a browser, it produces identical results across every path, and it
+establishes the crossover question rather than answering it.
+
+---
+
+## 14. Open items
 
 * **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
 * **Needed:** an emscripten toolchain for the WASM milestone.

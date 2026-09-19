@@ -19,9 +19,10 @@ bytes fetched as well as milliseconds.
 | FTS5 baseline (to 1M docs) | **done** |
 | Product quantization (64 B/doc) | **done** |
 | HNSW, validated against `hnswlib` | **done** |
-| DiskANN / Vamana page-local index | next |
-| Late interaction (fast-plaid style) | blocked — see below |
-| WASM browser demo | planned |
+| DiskANN / Vamana page-local index | **done** |
+| WASM build + browser demo | **done** |
+| Late interaction index | **done** (quality blocked — see below) |
+| Million-document dense measurements | in progress |
 
 ### Headline results so far
 
@@ -37,6 +38,13 @@ bytes fetched as well as milliseconds.
   query on the same pages — free, and the single biggest lever found so far.
 * **PQ at 64 bytes is a candidate generator, not a ranker**: 99.2% of the exact
   top-10 lands in its top-100, but only 61% in its top-10.
+* **Resident PQ codes cut pages per query by 6.6–18x at identical recall**, in
+  exchange for one bulk download whose cost depends on corpus size.
+* **The httpvfs client can defeat the whole exercise.** `sql.js-httpvfs` escalates
+  its read-ahead past a megabyte and pulls a 5.9 MB database whole on the first
+  query. Bounded Range requests against the flat record format move 9.1 KB per query
+  instead of 512 KB — but in 69 requests rather than one, which is slower on a
+  70 ms link. At small scale, downloading everything wins.
 
 See [RESEARCH_LOG.md](RESEARCH_LOG.md) for methodology and full tables.
 
@@ -55,6 +63,8 @@ is which; they were identified from graph structure and verified by running them
 | `model_qint8_arm64.onnx` | `all-MiniLM-L6-v2` | 22.6M | `[batch, seq, 384]` | dense — mean-pool + L2 normalise |
 | `model_int8.onnx` | `lightonai/LateOn-Code-edge` | 17.0M | `[batch, seq, 48]` | late interaction — per-token, pre-normalised |
 
+![the demo running in a browser](docs/demo.png)
+
 ## Quick start
 
 ```sh
@@ -62,6 +72,9 @@ apt-get install wamerican      # supplies /usr/share/dict/words
 make corpora queries           # regenerate all benchmark data
 make fts5                      # run the FTS5 baseline at all scales
 make test                      # run the Rust test suite
+make tokenizer-parity          # diff the Rust and Python tokenizers
+make wasm-test                 # check the browser build against the native one
+make demo && make demo-serve   # build and serve the browser demo
 ```
 
 ## Data is generated, not committed
