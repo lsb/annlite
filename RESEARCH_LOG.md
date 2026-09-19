@@ -976,31 +976,47 @@ Result: **3,366 functions**, mean 13.5 lines, 1.79 MB, SHA-256 `df079baf…f4a81
 
 ### 15.1 Head to head, 500 queries
 
-| system | success@1 | success@10 | success@100 | MRR@10 | index build | ms/query | bytes/doc |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| BM25 (FTS5) | 0.280 | 0.542 | 0.762 | 0.362 | 0.0 s | 2.5 | — |
-| Dense (MiniLM, mean-pooled) | 0.350 | 0.698 | 0.932 | 0.463 | 55.6 s | 0.3 | 1,536 |
-| **Late interaction (LateOn)** | **0.456** | **0.782** | **0.948** | **0.568** | 117.5 s | 277 | **27,797** |
+| system | success@1 | success@10 | success@100 | MRR@10 | index build | bytes/doc |
+|---|---:|---:|---:|---:|---:|---:|
+| BM25 (FTS5) | 0.280 | 0.542 | 0.762 | 0.362 | 0.0 s | — |
+| Dense (MiniLM, mean-pooled) | 0.350 | 0.698 | 0.932 | 0.463 | 55.6 s | 1,536 |
+| **Late interaction (LateOn)** | **0.454** | **0.780** | **0.950** | **0.567** | 123.4 s | **28,240** |
 
-Late interaction wins on every quality measure: **63% better success@1 than BM25 and
-30% better than dense**, with MRR@10 of 0.568 against 0.463 and 0.362. This is what
+Per-query latency is deliberately omitted from this table. Both runs shared the
+machine with a million-document index build, and the figures moved by more than a
+factor of two between runs that differed only in how much else was executing. The
+quality columns are unaffected by contention; the timing columns would be dishonest.
+
+*Sensitivity to the sequence cap.* An earlier version of this table capped documents
+at 512 tokens, which silently truncated 91 of the 3,366 -- a number picked without
+grounding, when the tokenizer declares 2047 and the model, being RoPE-based, accepts
+a 740-token input unchanged. Re-running uncapped moved success@1 from 0.456 to 0.454
+and MRR@10 from 0.568 to 0.567, which on 500 queries is one query either way, and
+raised storage 1.6% (27,797 to 28,240 bytes per document). **The cap was a real
+defect with no measurable effect**, which is worth stating in both directions: the
+configuration is now principled, and anyone reproducing the earlier numbers should
+not expect the difference to show.
+
+Late interaction wins on every quality measure: **62% better success@1 than BM25 and
+30% better than dense**, with MRR@10 of 0.567 against 0.463 and 0.362. This is what
 the random-word corpus could not show, and it is the result that justifies the model
 being in the repository at all.
 
-It also shows what late interaction costs. **27,797 bytes per document** — 18x dense
+It also shows what late interaction costs. **28,240 bytes per document** — 18x dense
 and, at a mean of 144.8 tokens per document, the dominant term in any storage budget.
-Extrapolated to a million documents that is **27 GB**, against 1.5 GB for dense
-float32 and 64 MB for dense PQ. Exact MaxSim at 277 ms/query is roughly 900x slower
-than a dense dot product.
+Extrapolated to a million documents that is **28 GB**, against 1.5 GB for dense
+float32 and 64 MB for dense PQ. Exact MaxSim is two to three orders of magnitude
+slower per query than a dense dot product; the exact ratio is not quoted, for the
+contention reason above.
 
 So the ranking on quality and the ranking on cost are exactly inverted, and neither
 number alone decides anything. That is the case PLAID compression exists to
 address, and section 12's staged pipeline is measured against this corpus next.
 
-The exact-MaxSim figures were computed independently in Python and in Rust and agree
-to three decimals (0.456 / 0.782, 27,796 vs 27,797 bytes per document from integer
-rounding), which is the cross-check that the two implementations of the scoring
-function agree.
+The exact-MaxSim figures were computed independently in Python and in Rust and agreed
+to three decimals on the capped run (0.456 / 0.782, and 27,796 against 27,797 bytes
+per document from integer rounding), which is the cross-check that the two
+implementations of the scoring function agree.
 
 ### 15.2 PLAID compression on the code corpus
 

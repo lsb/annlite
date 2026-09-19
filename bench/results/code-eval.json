@@ -8,7 +8,7 @@
       "success@100": 0.762,
       "mrr@10": 0.3618293650793651,
       "build_s": 0.0,
-      "ms_per_query": 2.53
+      "ms_per_query": 2.57
     },
     "Dense (MiniLM)": {
       "success@1": 0.35,
@@ -16,18 +16,18 @@
       "success@100": 0.932,
       "mrr@10": 0.4633753968253968,
       "build_s": 55.6,
-      "ms_per_query": 0.3,
+      "ms_per_query": 0.31,
       "bytes_per_doc": 1536
     },
     "Late interaction (LateOn)": {
-      "success@1": 0.456,
-      "success@10": 0.782,
-      "success@100": 0.948,
-      "mrr@10": 0.5681579365079364,
-      "build_s": 117.5,
-      "ms_per_query": 277.01,
-      "bytes_per_doc": 27797,
-      "mean_tokens_per_doc": 144.8
+      "success@1": 0.454,
+      "success@10": 0.78,
+      "success@100": 0.95,
+      "mrr@10": 0.5670031746031745,
+      "build_s": 123.4,
+      "ms_per_query": 120.03,
+      "bytes_per_doc": 28240,
+      "mean_tokens_per_doc": 147.1
     }
   }
 }

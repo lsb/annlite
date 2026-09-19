@@ -18,6 +18,12 @@ Two conventions matter and both were settled by measurement rather than assumpti
 * **Special tokens are kept.** `[CLS]` and `[SEP]` come from the tokenizer's own
   template. Dropping them measured identically (5/5 either way), so they stay, which
   keeps the encoder faithful to the template rather than second-guessing it.
+
+The default `max_length` is the tokenizer's own declared limit rather than a round
+number. An earlier version capped at 512, which silently truncated 91 of the 3,366
+code documents; the model is RoPE-based and has no position-table ceiling, and was
+verified to accept a 740-token input unchanged. Truncating documents costs recall in
+a way that looks like model weakness rather than like a configuration mistake.
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ class LateEncoder:
         self,
         model_path: str | Path,
         tokenizer_path: str | Path,
-        max_length: int = 512,
+        max_length: int = 2047,
         threads: int | None = None,
     ):
         opts = ort.SessionOptions()
