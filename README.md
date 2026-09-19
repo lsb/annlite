@@ -21,7 +21,8 @@ bytes fetched as well as milliseconds.
 | HNSW, validated against `hnswlib` | **done** |
 | DiskANN / Vamana page-local index | **done** |
 | WASM build + browser demo | **done** |
-| Late interaction index | **done** (quality blocked — see below) |
+| Late interaction (fast-plaid style) | **done** |
+| Code-search corpus with ground truth | **done** |
 | Million-document dense measurements | in progress |
 
 ### Headline results so far
@@ -38,6 +39,10 @@ bytes fetched as well as milliseconds.
   query on the same pages — free, and the single biggest lever found so far.
 * **PQ at 64 bytes is a candidate generator, not a ranker**: 99.2% of the exact
   top-10 lands in its top-100, but only 61% in its top-10.
+* **The `[MASK]` pad token is a trap.** `LateOn`'s tokenizer names `[MASK]` as its
+  pad token, which looks like ColBERT query augmentation. Attending to that padding
+  halves retrieval accuracy (5/5 to 2/5 on a probe), because MaxSim gives every
+  padded position another maximum to take.
 * **Resident PQ codes cut pages per query by 6.6–18x at identical recall**, in
   exchange for one bulk download whose cost depends on corpus size.
 * **The httpvfs client can defeat the whole exercise.** `sql.js-httpvfs` escalates
@@ -48,9 +53,19 @@ bytes fetched as well as milliseconds.
 
 See [RESEARCH_LOG.md](RESEARCH_LOG.md) for methodology and full tables.
 
-**Blocked:** late interaction needs the `tokenizer.json` for `LateOn-Code-edge`.
-`huggingface.co` is unreachable from the build environment and no `tokenizer.json`
-is committed. See [RESEARCH_LOG.md §3.2](RESEARCH_LOG.md).
+On a code-search benchmark built from the Python standard library (3,366 functions,
+docstring as query, the function itself as ground truth):
+
+| system | success@1 | MRR@10 | bytes/doc |
+|---|---:|---:|---:|
+| BM25 (FTS5) | 0.280 | 0.362 | — |
+| Dense (MiniLM) | 0.350 | 0.463 | 1,536 |
+| **Late interaction (LateOn)** | **0.456** | **0.568** | 27,797 |
+| Late interaction + PLAID, 2,048 centroids | 0.454 | — | **695** |
+
+Late interaction is 63% better than BM25 at success@1 and 30% better than dense —
+and costs 18x dense to store, until PLAID compression brings it back to 695 bytes
+per document at 99.6% of exact quality.
 
 ## Models
 

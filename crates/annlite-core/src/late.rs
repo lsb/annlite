@@ -88,6 +88,26 @@ impl LateIndex {
     /// count: enough centroids that a cluster is small, few enough that the centroid
     /// table stays resident.
     pub fn build(docs: &[MultiVector], k: usize, iters: usize, seed: u64) -> Result<Self> {
+        Self::build_sampled(docs, k, iters, seed, 0)
+    }
+
+    /// As [`LateIndex::build`], but fitting centroids on at most `train_sample`
+    /// tokens rather than all of them.
+    ///
+    /// Lloyd's algorithm costs `tokens * k * dim` per iteration, which at half a
+    /// million tokens and a few thousand centroids is tens of billions of operations
+    /// per pass. Centroid positions converge from a sample long before the cost of
+    /// using every token is justified, and every token is still assigned afterwards,
+    /// so the index itself is complete. The sample is taken by stride rather than at
+    /// random, which keeps it deterministic and spreads it across the corpus instead
+    /// of favouring the first few documents.
+    pub fn build_sampled(
+        docs: &[MultiVector],
+        k: usize,
+        iters: usize,
+        seed: u64,
+        train_sample: usize,
+    ) -> Result<Self> {
         anyhow::ensure!(!docs.is_empty(), "cannot build over an empty corpus");
         let dim = docs[0].dim;
         anyhow::ensure!(docs.iter().all(|d| d.dim == dim), "documents disagree on dimension");
@@ -101,8 +121,17 @@ impl LateIndex {
             flat.extend_from_slice(&d.data);
         }
         let pool = Vectors { data: flat, dim };
-        let assign = crate::pq::kmeans_assign(&pool, k, iters, seed);
-        let centroids = crate::pq::kmeans_centroids(&pool, k, iters, seed);
+        let centroids = if train_sample > 0 && train_sample < total {
+            let stride = (total / train_sample).max(1);
+            let mut sample = Vec::with_capacity(train_sample * dim);
+            for i in (0..total).step_by(stride).take(train_sample) {
+                sample.extend_from_slice(pool.row(i));
+            }
+            crate::pq::kmeans_centroids(&Vectors { data: sample, dim }, k, iters, seed)
+        } else {
+            crate::pq::kmeans_centroids(&pool, k, iters, seed)
+        };
+        let assign = assign_to(&pool, &centroids, k, dim);
 
         let mut codes = Vec::with_capacity(total);
         let mut offsets = Vec::with_capacity(docs.len() + 1);
@@ -227,4 +256,23 @@ impl LateIndex {
         cands.truncate(k);
         cands
     }
+}
+
+/// Nearest centroid for every vector in `pool`.
+fn assign_to(pool: &Vectors, centroids: &[f32], k: usize, dim: usize) -> Vec<u32> {
+    (0..pool.len())
+        .map(|i| {
+            let p = pool.row(i);
+            let mut best = 0u32;
+            let mut best_d = f32::INFINITY;
+            for c in 0..k {
+                let d = crate::vectors::sqeuclidean(p, &centroids[c * dim..(c + 1) * dim]);
+                if d < best_d {
+                    best_d = d;
+                    best = c as u32;
+                }
+            }
+            best
+        })
+        .collect()
 }

@@ -900,7 +900,154 @@ establishes the crossover question rather than answering it.
 
 ---
 
-## 14. Open items
+## 14. Late interaction, with the real tokenizer
+
+`tokenizer.json` arrived mid-project and unblocks section 3.2.
+
+### 14.1 What it is, and that it matches
+
+ByteLevel BPE, NFC normalisation, 50,280 vocabulary entries plus 118 added tokens
+reaching id 50,369 — so **50,370 tokens, exactly the row count of the checkpoint's
+`tok_embeddings.weight [50370, 256]`**. The template wraps input as
+`[CLS] … [SEP]` with `[CLS]`=50281, `[SEP]`=50282. This is the ModernBERT family, as
+the graph's rotary embeddings and `tok_embeddings` naming implied.
+
+The reference `tokenizers` library is used rather than a hand-written ByteLevel BPE.
+The WordPiece port in section 5.1 was worth writing because it is 150 lines and had
+to run in WASM; ByteLevel BPE with a 50k merge table is neither.
+
+Per-token output norms measure **exactly 1.0000**, confirming the structural reading
+in section 2.2 that the graph's trailing `ReduceL2`/`Clip` normalises its output.
+MaxSim is therefore a plain dot product with no normalisation step.
+
+### 14.2 Finding: the `[MASK]` pad token is a trap
+
+`tokenizer.json` names **`[MASK]` (50284) as its padding token**. That is exactly
+what ColBERT's query augmentation looks like: pad the query with `[MASK]` and
+*attend to* those positions, so the model fills them with learned query expansion.
+
+Following that convention here is wrong, and measurably so. On a five-query
+code-retrieval probe:
+
+| convention | top-1 |
+|---|---:|
+| pad queries to 32 with `[MASK]`, attend to padding | **2/5** |
+| no padding | **5/5** |
+| no padding, special tokens dropped | 5/5 |
+| pad to 32 with `[MASK]`, special tokens dropped | 2/5 |
+
+With padding attended to, one long document won every query it was not the answer
+to. The reason is structural: MaxSim sums a maximum over document tokens *for each
+query token*, so 15 meaningless `[MASK]` vectors appended to a 17-token query add 15
+more maxima, which are largest for whichever document has the most tokens to offer.
+The augmentation is a trained behaviour, not a free one, and this model was not
+trained with it.
+
+The encoder therefore excludes padded positions from both the attention mask and the
+returned vectors. Special tokens are kept, since dropping them measured identically
+and keeping them stays faithful to the tokenizer's own template.
+
+This is the kind of error that does not announce itself: every vector still looks
+plausible, every norm is still 1.0, and retrieval quality quietly halves.
+
+---
+
+## 15. A corpus the code model can actually be measured on
+
+`LateOn-Code-edge` is a **code** model. Evaluating it on bags of random dictionary
+words measures nothing it was trained to do, so a second corpus was added.
+
+`tools/corpus/code.py` builds the standard docstring-to-code benchmark from the
+local Python standard library, the same construction CodeSearchNet uses:
+
+* a **document** is a function's source with its docstring removed;
+* a **query** is the first sentence of that docstring;
+* the **gold answer** is the function the docstring came from.
+
+Relevance is established by construction rather than by judgment. Removing the
+docstring is essential: leaving it in makes the query a literal substring of its own
+answer, which degenerates the task into exact matching and would flatter every
+lexical baseline. Ordering is by content hash, not filesystem order, so the corpus
+does not depend on how the standard library happens to be laid out, and identical
+function bodies are deduplicated so "gold" is never ambiguous.
+
+Result: **3,366 functions**, mean 13.5 lines, 1.79 MB, SHA-256 `df079baf…f4a818`.
+
+### 15.1 Head to head, 500 queries
+
+| system | success@1 | success@10 | success@100 | MRR@10 | index build | ms/query | bytes/doc |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| BM25 (FTS5) | 0.280 | 0.542 | 0.762 | 0.362 | 0.0 s | 2.5 | — |
+| Dense (MiniLM, mean-pooled) | 0.350 | 0.698 | 0.932 | 0.463 | 55.6 s | 0.3 | 1,536 |
+| **Late interaction (LateOn)** | **0.456** | **0.782** | **0.948** | **0.568** | 117.5 s | 277 | **27,797** |
+
+Late interaction wins on every quality measure: **63% better success@1 than BM25 and
+30% better than dense**, with MRR@10 of 0.568 against 0.463 and 0.362. This is what
+the random-word corpus could not show, and it is the result that justifies the model
+being in the repository at all.
+
+It also shows what late interaction costs. **27,797 bytes per document** — 18x dense
+and, at a mean of 144.8 tokens per document, the dominant term in any storage budget.
+Extrapolated to a million documents that is **27 GB**, against 1.5 GB for dense
+float32 and 64 MB for dense PQ. Exact MaxSim at 277 ms/query is roughly 900x slower
+than a dense dot product.
+
+So the ranking on quality and the ranking on cost are exactly inverted, and neither
+number alone decides anything. That is the case PLAID compression exists to
+address, and section 12's staged pipeline is measured against this corpus next.
+
+The exact-MaxSim figures were computed independently in Python and in Rust and agree
+to three decimals (0.456 / 0.782, 27,796 vs 27,797 bytes per document from integer
+rounding), which is the cross-check that the two implementations of the scoring
+function agree.
+
+### 15.2 PLAID compression on the code corpus
+
+Staged retrieval per section 12, measured against the exact MaxSim ceiling on the
+same 3,366 documents and 500 queries. `cand@k` is the centroid-only ranking;
+`rerank@1` is after exact rescoring of a 100-document pool.
+
+| centroids | bytes/doc | compression | cand@1 | cand@10 | **rerank@1** | ms/query | build |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| exact (no compression) | 27,796 | 1.0x | — | — | **0.456** | 321.8 | — |
+| 512 | 608 | **45.7x** | 0.180 | 0.498 | 0.434 | 36.1 | 24 s |
+| 1,024 | 637 | 43.6x | 0.258 | 0.588 | 0.444 | 36.3 | 48 s |
+| **2,048** | **695** | **39.9x** | 0.314 | 0.672 | **0.454** | **37.3** | 96 s |
+
+At 2,048 centroids the index is **40x smaller and 8.6x faster while retaining 99.6%
+of exact quality** (0.454 against 0.456). That is what makes late interaction
+storable at all: 27.8 KB per document extrapolates to 27 GB at a million documents,
+while 695 bytes extrapolates to 695 MB — the same order as the FTS5 baseline's
+730 MB, and therefore in the range a real deployment can consider.
+
+Raising the centroid count trades compression for a better *first-stage* ranking
+(cand@1 climbs 0.180 to 0.314) because finer centroids approximate tokens better.
+After exact reranking most of that difference disappears, which is the expected
+shape: the first stage only has to get the right document into the pool.
+
+### 15.3 Null result: probe width does nothing at this corpus size
+
+Probing 4, 16 or 32 centroids per query token changes the numbers in the third
+decimal place. That is not a bug, and the arithmetic says why.
+
+A document here holds a mean of 144.8 tokens. With `k` centroids, a document
+therefore touches on the order of 145 of them — at `k = 512` that is **28% of every
+centroid in the index**. So any single centroid's posting list already contains
+roughly a quarter of the corpus, and a query with 17 tokens probing even one centroid
+each retrieves nearly all 3,366 documents. There is nothing left for a wider probe to
+add.
+
+**PLAID's inverted list provides no pruning at this scale**, and the speedup measured
+above comes entirely from the other two mechanisms: centroid-only scoring is cheaper
+per candidate than full MaxSim, and exact rescoring runs over 100 documents instead
+of 3,366. Selectivity would require a corpus large enough that a centroid appears in
+a small fraction of documents — which, at 145 tokens per document, means `k` far
+above the document count. This corpus cannot show that, and the honest reading is
+that the candidate-generation stage is untested here rather than that it is useless.
+
+---
+
+## 16. Open items
 
 * **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
 * **Needed:** an emscripten toolchain for the WASM milestone.
