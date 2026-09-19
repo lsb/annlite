@@ -987,6 +987,37 @@ machine with a million-document index build, and the figures moved by more than 
 factor of two between runs that differed only in how much else was executing. The
 quality columns are unaffected by contention; the timing columns would be dishonest.
 
+**What success@1 means here, and its ceiling.** Each query has exactly one correct
+document — the function its docstring was taken from — so success@1 is the fraction
+of queries whose gold document is ranked first out of 3,366, identical to precision@1
+and to plain accuracy. This is *known-item* retrieval, not topical relevance: a
+system returning a genuinely better-matching function scores zero unless it is the
+source one. That harshness is deliberate, since it is what removes human judgment
+from the benchmark, but it has a consequence worth stating.
+
+**7.4% of the eval queries cannot be answered at all.** Their docstring appears
+verbatim on two or three different functions, so the query text carries nothing that
+could distinguish them:
+
+| docstring shared by | queries in the 500-query eval set |
+|---|---:|
+| 1 function (answerable) | 463 |
+| 2 functions | 35 |
+| 3 functions | 2 |
+
+For a docstring shared by `m` functions, any fixed ranking answers exactly one of
+those `m` queries correctly, so the **maximum attainable success@1 is 0.962**, not
+1.0. Against that ceiling the measured scores are BM25 **0.291**, dense **0.364**,
+late interaction **0.472**. The ordering is unchanged and the correction is under
+five points, but quoting the raw figures against 1.0 overstates the remaining
+headroom, and `code_eval.py` now computes and prints the ceiling rather than leaving
+it to a footnote.
+
+Two things that are *not* confounds here, both checked: BM25 hits a tie at rank 1 on
+only **0.2%** of queries — unlike the word corpus, where ties were the dominant
+effect and made FTS5's single-term score meaningless (section 9.6) — and no query
+lacks usable query terms.
+
 *Sensitivity to the sequence cap.* An earlier version of this table capped documents
 at 512 tokens, which silently truncated 91 of the 3,366 -- a number picked without
 grounding, when the tokenizer declares 2047 and the model, being RoPE-based, accepts

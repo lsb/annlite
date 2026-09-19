@@ -27,6 +27,26 @@ def unescape(line: str) -> str:
     return line.rstrip("\n").replace("\\n", "\n").replace("\\\\", "\\")
 
 
+def attainable_ceiling(queries: list[dict], all_queries: list[dict]) -> tuple[float, int]:
+    """Highest success@1 any system could reach on this query set.
+
+    The benchmark is known-item retrieval: each query has exactly one correct
+    document. But a docstring that appears verbatim on several functions makes those
+    queries mutually indistinguishable -- the query text carries nothing that could
+    separate them -- so for a docstring shared by `m` functions, any fixed ranking
+    answers exactly one of those `m` queries correctly.
+
+    The ceiling is therefore the mean of `1/m`, and quoting success@1 against 1.0
+    rather than against this number overstates how much headroom is left.
+    """
+    import collections
+
+    multiplicity = collections.Counter(q["text"] for q in all_queries)
+    ambiguous = sum(1 for q in queries if multiplicity[q["text"]] > 1)
+    ceiling = sum(1.0 / multiplicity[q["text"]] for q in queries) / len(queries)
+    return ceiling, ambiguous
+
+
 def metrics(ranks: list[int]) -> dict:
     r = np.array(ranks, dtype=float)
     return {
@@ -41,8 +61,13 @@ def main() -> int:
     n_q = int(sys.argv[1]) if len(sys.argv) > 1 else 500
     docs = [unescape(l) for l in open(REPO / "data/corpus/code-docs.txt", encoding="utf-8")]
     qs = [json.loads(l) for l in open(REPO / "data/corpus/code-queries.jsonl", encoding="utf-8")]
+    all_qs = qs
     qs = qs[:n_q]
+    ceiling, ambiguous = attainable_ceiling(qs, all_qs)
     print(f"{len(docs)} documents, {len(qs)} queries", flush=True)
+    print(f"{ambiguous} queries ({ambiguous / len(qs) * 100:.1f}%) share a docstring with "
+          f"another function and cannot be answered as known-item retrieval; "
+          f"maximum attainable success@1 is {ceiling:.3f}", flush=True)
     results = {}
 
     # --- BM25 via FTS5 -----------------------------------------------------
@@ -111,18 +136,25 @@ def main() -> int:
         "mean_tokens_per_doc": round(tokens / len(docs), 1),
     }
 
-    print(f"\n{'system':<28} {'succ@1':>7} {'succ@10':>8} {'succ@100':>9} {'MRR@10':>7} "
-          f"{'build_s':>8} {'ms/query':>9} {'B/doc':>8}")
-    print("-" * 92)
+    print(f"\n{'system':<28} {'succ@1':>7} {'of max':>7} {'succ@10':>8} {'succ@100':>9} "
+          f"{'MRR@10':>7} {'build_s':>8} {'B/doc':>8}")
+    print("-" * 88)
     for name, m in results.items():
-        print(f"{name:<28} {m['success@1']:>7.3f} {m['success@10']:>8.3f} "
-              f"{m['success@100']:>9.3f} {m['mrr@10']:>7.3f} {m['build_s']:>8.1f} "
-              f"{m['ms_per_query']:>9.2f} {str(m.get('bytes_per_doc','-')):>8}")
+        print(f"{name:<28} {m['success@1']:>7.3f} {m['success@1'] / ceiling:>7.3f} "
+              f"{m['success@10']:>8.3f} {m['success@100']:>9.3f} {m['mrr@10']:>7.3f} "
+              f"{m['build_s']:>8.1f} {str(m.get('bytes_per_doc','-')):>8}")
+    print(f"\nsuccess@1 ceiling {ceiling:.3f}; 'of max' is success@1 divided by it.")
+    print("Per-query latency is not reported: these runs share the machine with index")
+    print("builds, and the timings move by more than 2x with background load.")
 
     out = REPO / "bench/results/code-eval.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"documents": len(docs), "queries": len(qs),
-                               "results": results}, indent=2) + "\n")
+    out.write_text(json.dumps({
+        "documents": len(docs), "queries": len(qs),
+        "success_at_1_ceiling": round(ceiling, 4),
+        "ambiguous_queries": ambiguous,
+        "results": results,
+    }, indent=2) + "\n")
     print(f"\n-> {out}")
     # Keep the multi-vector embeddings for the PLAID index measurement.
     np.save(REPO / "data/embeddings/code-late-lengths.npy",

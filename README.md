@@ -75,7 +75,10 @@ are scored either way, and a test pins it.
 Docstring-to-code benchmark from the Python standard library (3,366 functions;
 document is the function with its docstring removed, query is the docstring, gold is
 the function). Ground truth comes from the construction, so no judgments are
-involved.
+involved. `success@1` is the fraction of queries whose one correct function is ranked
+first out of 3,366 — known-item retrieval, so a better-matching but different
+function still scores zero. **7.4% of queries share a docstring with another function
+and so cannot be answered; the attainable ceiling is 0.962, not 1.0.**
 
 | system | success@1 | MRR@10 | bytes/doc |
 |---|---:|---:|---:|
@@ -83,6 +86,9 @@ involved.
 | Dense (MiniLM) | 0.350 | 0.463 | 1,536 |
 | **Late interaction (LateOn)** | **0.454** | **0.567** | 28,240 |
 | Late interaction + PLAID, 2,048 centroids | 0.454 | — | **695** |
+
+As a fraction of the 0.962 attainable: BM25 0.291, dense 0.364, late interaction
+**0.472**.
 
 Late interaction is 62% better than BM25 and 30% better than dense — and 18x dense
 to store, until PLAID staging brings it to 695 bytes per document while keeping
