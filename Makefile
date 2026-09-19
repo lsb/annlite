@@ -32,6 +32,9 @@ help:
 	@echo " measurement"
 	@echo "  make fts5           FTS5 baseline at all scales"
 	@echo "  make code-eval      BM25 vs dense vs late interaction on the code corpus"
+	@echo "  make fts5-code      FTS5 on the code corpus: pages, requests, quality"
+	@echo "  make ann-code       dense index on the code corpus (embeds first)"
+	@echo "  make tri-code       join both into bench/results/tri-code.jsonl"
 	@echo "  make late-pages     late interaction in SQLite: pages, requests, hops per stage"
 	@echo "  make matrix         join every result into docs/RESULTS.md"
 	@echo ""
@@ -166,7 +169,7 @@ demo-serve:
 # A code model cannot be evaluated on bags of dictionary words, so this builds the
 # docstring-to-code benchmark from the local Python standard library. Ground truth
 # is the corpus construction itself: a docstring's own function.
-.PHONY: code-corpus code-eval late-pages
+.PHONY: code-corpus code-eval fts5-code code-dense ann-code tri-code late-pages
 
 code-corpus: $(CORPUS)/code-docs.txt
 $(CORPUS)/code-docs.txt:
@@ -175,6 +178,45 @@ $(CORPUS)/code-docs.txt:
 code-eval: code-corpus
 	$(PYTHON) tools/analyze/code_eval.py $(or $(NQ),500)
 	$(CARGO) run --release -p annlite-core --example late_eval
+
+# The same corpus measured the way the word corpora are, so the three retrieval
+# systems can be compared on cost as well as on quality. NQ is fixed at 500 to match
+# bench/results/code-eval.json; raising it makes nothing comparable.
+CODE_NQ   ?= 500
+EMBED     := $(DATA)/embeddings
+
+fts5-code: $(FTS5_BIN) $(CORPUS)/code-docs.txt
+	$(FTS5_BIN) --docs $(CORPUS)/code-docs.txt --queries $(CORPUS)/code-queries.jsonl \
+	  --name code --sample $(CODE_NQ)
+
+# Documents carry escaped newlines; without --unescape the encoder sees a backslash
+# and an `n` at every line break.
+$(EMBED)/code-dense.f32: $(CORPUS)/code-docs.txt
+	$(PYTHON) -m tools.embed --input $< --out $@ --unescape
+$(EMBED)/code-dense-q.f32: $(CORPUS)/code-queries.jsonl
+	$(PYTHON) -m tools.embed --input $< --out $@
+
+code-dense: $(EMBED)/code-dense.f32 $(EMBED)/code-dense-q.f32
+
+# Parameters are scaled to 3,366 documents rather than inherited from the 10k-1M
+# runs: R=24 keeps the record at 130 bytes, and PQ trains on the whole corpus because
+# at this size a sample buys nothing.
+ann-code: code-dense
+	$(CARGO) build --release -p annlite-sqlite
+	./target/release/annlite-sqlite --docs $(EMBED)/code-dense.f32 \
+	  --queries $(EMBED)/code-dense-q.f32 --gold $(CORPUS)/code-queries.jsonl \
+	  --scale code --dim 384 --m 32 --r 24 --l-build 64 --pq-train 3366 \
+	  --n-queries $(CODE_NQ) --k 100 --search-l 100,128,256 --beams 4 \
+	  --orderings identity,bfs
+	./target/release/annlite-sqlite --docs $(EMBED)/code-dense.f32 \
+	  --queries $(EMBED)/code-dense-q.f32 --gold $(CORPUS)/code-queries.jsonl \
+	  --scale code-m64 --dim 384 --m 64 --r 24 --l-build 64 --pq-train 3366 \
+	  --n-queries $(CODE_NQ) --k 100 --search-l 128 --beams 4 --orderings bfs
+
+# Flattens both into one row per (system, configuration). Rows written by other
+# systems are preserved, so the three can be measured independently.
+tri-code:
+	$(PYTHON) tools/analyze/tri_code.py
 
 # Late interaction with page accounting, so it can be set against FTS5 and dense on
 # the axis the project is about rather than on quality alone. Needs the multi-vector

@@ -33,11 +33,16 @@ pub enum TermSplit {
     ///
     /// A docstring is a sentence, and splitting it on whitespace would quote chunks
     /// like `load_module().` — which FTS5 reads as the *phrase* `load module` rather
-    /// than as two independent terms. The query would then silently demand adjacency
-    /// it has no reason to demand, and a document mentioning only `module` would stop
-    /// being a candidate. Splitting on non-alphanumerics instead produces exactly the
+    /// than as two independent terms, silently demanding an adjacency the query has
+    /// no reason to demand. Splitting on non-alphanumerics instead yields exactly the
     /// tokens the `unicode61` tokenizer put in the index, each free to match on its
-    /// own, which is the comparison the ANN systems need.
+    /// own, which is what lets BM25 rank partial matches.
+    ///
+    /// Measured on the 500-query code set, the whitespace form does not error and does
+    /// not return nothing; it scores success@10 0.504 and MRR@10 0.341 against 0.542
+    /// and 0.362. The failure mode this prevents is a quiet 6% on the ranking metric,
+    /// not a crash — and it is also what `tools/analyze/code_eval.py` does, so the
+    /// Rust and Python measurements of the same baseline agree.
     Alphanumeric,
 }
 

@@ -60,16 +60,16 @@ fn an_escaped_corpus_is_indexed_as_the_source_it_encodes() {
     assert!(hits(&c, "n", query::TermSplit::Alphanumeric).is_empty());
     assert_eq!(hits(&c, "return", query::TermSplit::Alphanumeric).len(), 3);
 
-    // A docstring, asked as a docstring. Splitting on whitespace quotes
-    // `load_module().`, which FTS5 reads as the phrase `load module` — so only the
-    // document with those tokens adjacent stays a candidate, and `module load helper`
-    // drops out although it shares both terms. Splitting on non-alphanumerics keeps
-    // both, which is what lets BM25 rank partial matches.
-    let text = "Load a module, given information returned by load_module().";
-    let mut both = hits(&c, text, query::TermSplit::Alphanumeric);
+    // The mechanism, isolated. `load_module().` quoted whole is the phrase
+    // `load module`, so it matches only where those two tokens are adjacent and in
+    // order; split on non-alphanumerics it is two independent terms, and the document
+    // that has them the other way round is a candidate too. On the real 500-query set
+    // the difference is worth MRR@10 0.341 against 0.362 -- FTS5 does not fail on the
+    // whitespace form, it quietly answers a narrower question.
+    let mut both = hits(&c, "load_module().", query::TermSplit::Alphanumeric);
     both.sort_unstable();
     assert_eq!(both, vec![0, 2], "candidate set, not ranking: BM25 decides the order");
-    assert_eq!(hits(&c, text, query::TermSplit::Whitespace), vec![0]);
+    assert_eq!(hits(&c, "load_module().", query::TermSplit::Whitespace), vec![0]);
     drop(c);
 
     // Both databases are still well-formed FTS5 at the project's page size; the

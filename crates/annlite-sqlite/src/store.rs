@@ -101,6 +101,21 @@ pub fn write_index(
         let mut vec_stmt = tx.prepare("INSERT INTO annlite_vectors(id, v) VALUES (?1, ?2)")?;
         let mut doc_stmt = tx.prepare("INSERT INTO annlite_docs(id, body) VALUES (?1, ?2)")?;
 
+        // One table at a time, not one row at a time.
+        //
+        // This ordering is the whole point of the format and it is easy to get
+        // wrong. SQLite allocates a leaf page to whichever table needs one next, so
+        // interleaving the three inserts hands out pages round-robin and the node
+        // table ends up striped across the file -- measured at file pages 18, 19,
+        // 30, 41, 52 and so on, gaps of eleven, with 0.2% of consecutive node pages
+        // actually adjacent on disk.
+        //
+        // That silently defeats the entire page-locality design. Node ids decide
+        // pages only if consecutive ids land on consecutive *file* pages; if they do
+        // not, a client can never coalesce two logically adjacent pages into one
+        // range request, and reordering nodes buys nothing a range fetch can use.
+        // Filling `annlite_nodes` to completion before touching the other tables
+        // gives it a contiguous run of the file.
         for new_id in 0..n {
             let old = perm.old_id_of[new_id] as usize;
             // Neighbour ids are rewritten into the new numbering; storing old ids
@@ -112,16 +127,24 @@ pub fn write_index(
                 .collect();
             let code = &codes[old * fmt.m..(old + 1) * fmt.m];
             node_stmt.execute(params![new_id as i64, fmt.encode(code, &neighbors)])?;
+        }
 
+        // Vectors next: reranking reads these, and it reads them in score order, so
+        // they benefit from contiguity far less than the graph does -- but striping
+        // them through the node table would hurt the graph, which is what matters.
+        for new_id in 0..n {
+            let old = perm.old_id_of[new_id] as usize;
             let v = vectors.row(old);
             let mut bytes = Vec::with_capacity(v.len() * 4);
             for x in v {
                 bytes.extend_from_slice(&x.to_le_bytes());
             }
             vec_stmt.execute(params![new_id as i64, bytes])?;
+        }
 
-            if let Some(d) = docs {
-                doc_stmt.execute(params![new_id as i64, &d[old]])?;
+        if let Some(d) = docs {
+            for new_id in 0..n {
+                doc_stmt.execute(params![new_id as i64, &d[perm.old_id_of[new_id] as usize]])?;
             }
         }
     }
