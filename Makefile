@@ -18,6 +18,7 @@ SCALES    := 100 10k 1m
 10k_N     := 10000
 1m_N      := 1000000
 
+.DEFAULT_GOAL := help
 .PHONY: all corpora queries clean clean-data help check-dict test matrix fts5
 
 help:
