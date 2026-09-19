@@ -10,5 +10,6 @@ pub mod hnsw;
 pub mod late;
 pub mod layout;
 pub mod pq;
+pub mod tokenize;
 pub mod vamana;
 pub mod vectors;

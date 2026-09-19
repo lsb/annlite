@@ -6,6 +6,7 @@ members = [
     "crates/annlite-fts5",
     "crates/annlite-netsim",
     "crates/annlite-sqlite",
+    "crates/annlite-wasm",
 ]
 
 [workspace.package]

@@ -87,3 +87,40 @@ clean-data:
 
 clean: clean-data
 	$(CARGO) clean
+
+# --- WebAssembly -----------------------------------------------------------
+WASM_TARGET := wasm32-unknown-unknown
+WASM_OUT    := web/pkg
+
+.PHONY: wasm wasm-test tokenizer-parity
+
+wasm:
+	$(CARGO) build --release -p annlite-wasm --target $(WASM_TARGET)
+	@command -v wasm-bindgen >/dev/null 2>&1 || { \
+	  echo "error: wasm-bindgen not found."; \
+	  echo "  cargo install wasm-bindgen-cli --version $$(grep -m1 -A1 '^name = \"wasm-bindgen\"' Cargo.lock | grep version | cut -d'\"' -f2)"; \
+	  exit 1; }
+	wasm-bindgen --target nodejs --out-dir $(WASM_OUT) \
+	  target/$(WASM_TARGET)/release/annlite_wasm.wasm
+	@echo "wasm -> $(WASM_OUT)"
+
+# Proves the browser build returns exactly what the native build returns, using a
+# fixture that carries a real index and the native answer for the same bytes.
+wasm-test: wasm web/testfixture.json
+	node web/test/parity.js
+
+web/testfixture.json: $(VOCAB)
+	$(CARGO) run --release -p annlite-sqlite --example wasm_fixture
+
+# The corpus is tokenized offline in Python and queries are tokenized in the
+# browser in Rust. If they ever disagree, every similarity is computed between
+# vectors from two different input distributions, so the two are diffed directly.
+tokenizer-parity: $(CORPUS)/docs-10k.txt
+	@$(CARGO) build --release -p annlite-core --example tokenize_dump 2>/dev/null
+	@$(PYTHON) tools/analyze/tokenizer_sample.py > /tmp/annlite-tok-sample.txt
+	@./target/release/examples/tokenize_dump models/tokenizers/bert-base-uncased-vocab.txt \
+	   < /tmp/annlite-tok-sample.txt > /tmp/annlite-tok-rust.txt
+	@$(PYTHON) tools/analyze/tokenizer_dump.py < /tmp/annlite-tok-sample.txt > /tmp/annlite-tok-py.txt
+	@diff -q /tmp/annlite-tok-rust.txt /tmp/annlite-tok-py.txt >/dev/null \
+	  && echo "tokenizers agree on $$(wc -l < /tmp/annlite-tok-sample.txt) lines" \
+	  || { echo "TOKENIZERS DISAGREE:"; diff /tmp/annlite-tok-rust.txt /tmp/annlite-tok-py.txt | head; exit 1; }
