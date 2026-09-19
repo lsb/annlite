@@ -18,15 +18,31 @@ SCALES    := 100 10k 1m
 10k_N     := 10000
 1m_N      := 1000000
 
-.PHONY: all corpora queries clean clean-data help check-dict test fts5
+.PHONY: all corpora queries clean clean-data help check-dict test matrix fts5
 
 help:
 	@echo "annlite benchmark pipeline"
-	@echo "  make corpora    generate document corpora at all scales (100 / 10k / 1M)"
-	@echo "  make queries    generate query sets for each corpus scale"
-	@echo "  make fts5       run the FTS5 baseline at all scales (results in bench/results)"
-	@echo "  make test       run the Rust test suite"
-	@echo "  make clean-data remove generated corpora (they regenerate byte-identically)"
+	@echo ""
+	@echo " data"
+	@echo "  make corpora        generate word corpora at all scales (100 / 10k / 1M)"
+	@echo "  make queries        generate query sets for each corpus scale"
+	@echo "  make code-corpus    build the docstring-to-code corpus from the stdlib"
+	@echo ""
+	@echo " measurement"
+	@echo "  make fts5           FTS5 baseline at all scales"
+	@echo "  make code-eval      BM25 vs dense vs late interaction on the code corpus"
+	@echo "  make matrix         join every result into docs/RESULTS.md"
+	@echo ""
+	@echo " browser"
+	@echo "  make wasm           build the WebAssembly module"
+	@echo "  make demo           build the browser demo"
+	@echo "  make demo-serve     serve it through the network simulator"
+	@echo ""
+	@echo " checks"
+	@echo "  make test              Rust test suite"
+	@echo "  make tokenizer-parity  diff the Rust and Python tokenizers"
+	@echo "  make wasm-test         check the browser build against the native one"
+	@echo "  make clean-data        remove generated corpora (they rebuild identically)"
 	@echo ""
 	@echo "Individual scales: make corpus-100 corpus-10k corpus-1m fts5-100 fts5-10k fts5-1m"
 
@@ -157,3 +173,10 @@ $(CORPUS)/code-docs.txt:
 code-eval: code-corpus
 	$(PYTHON) tools/analyze/code_eval.py $(or $(NQ),500)
 	$(CARGO) run --release -p annlite-core --example late_eval
+
+# --- Reporting -------------------------------------------------------------
+# Joins the separate benchmark outputs and converts measured counts into seconds
+# per network profile. Safe to run with only some benchmarks completed; missing
+# sections are simply omitted.
+matrix:
+	$(PYTHON) tools/analyze/matrix.py
