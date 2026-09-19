@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/annlite-core",
     "crates/annlite-corpus",
+    "crates/annlite-fts5",
     "crates/annlite-netsim",
 ]
 

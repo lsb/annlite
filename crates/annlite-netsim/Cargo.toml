@@ -6,6 +6,14 @@ license.workspace = true
 repository.workspace = true
 description = "HTTP byte-range server with configurable latency and throughput simulation"
 
+[lib]
+name = "annlite_netsim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "annlite-netsim"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -13,3 +21,5 @@ serde.workspace = true
 serde_json.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+sha2.workspace = true
+tiny_http = { version = "0.12", default-features = false }

@@ -223,7 +223,116 @@ query terms genuinely occur in their source document, and no query repeats a ter
 
 ---
 
-## 5. Open items
+## 5. Dense embedding pipeline
+
+### 5.1 Tokenizer
+
+`tools/embed/tokenization.py` implements BERT WordPiece directly rather than pulling
+in `transformers`. The browser target needs this same algorithm in Rust compiled to
+WASM, and one readable reference implementation can be pinned against the other with
+shared test vectors. `tools/tests/test_tokenization.py` holds those vectors: the
+reference ids for `"a man is playing a guitar on stage"` are
+`[101, 1037, 2158, 2003, 2652, 1037, 2858, 2006, 2754, 102]`, and the suite also
+covers accent stripping, punctuation splitting, all-or-nothing `[UNK]` handling, and
+truncation. 10/10 pass.
+
+The vocabulary is **committed** at `models/tokenizers/bert-base-uncased-vocab.txt`
+(SHA-256 `07eced37…2038a3`, 30,522 entries). Fetching it at runtime is not an option
+with Hugging Face blocked, and a retrieval benchmark whose tokenizer can silently
+change is not reproducible anyway.
+
+### 5.2 Pooling
+
+The ONNX graph emits `last_hidden_state` only. Two steps turn it into a sentence
+embedding and both matter:
+
+* **Masked** mean pooling. Averaging over padding positions pulls the embedding
+  toward whatever the model emits for `[PAD]`, and the size of that distortion
+  depends on how much padding the batch happens to carry — so an unmasked mean makes
+  a document's vector depend on its batchmates.
+* L2 normalisation, which makes the inner product equal cosine similarity and lets
+  every downstream index use plain dot products.
+
+### 5.3 Throughput
+
+Documents tokenize to ~100–120 WordPiece tokens (50 dictionary words, many of them
+rare and multi-piece). Measured on 4 cores:
+
+| Configuration | Throughput |
+|---|---:|
+| 1 process × 4 intra-op threads | ~53–131 docs/s (high variance under load) |
+| 1 process × 2 intra-op threads | ~79 docs/s |
+| **4 processes × 1 thread** | **158 docs/s** |
+
+A 6-layer model at batch 16 does not scale well across onnxruntime's intra-op
+threads — the per-operator work is too small to amortise synchronisation — whereas
+independent processes on disjoint shards scale nearly linearly. Workers write
+directly into their own slice of a shared memory-mapped output file, so there is no
+concatenation pass and peak memory is one batch per worker regardless of corpus size.
+
+At 158 docs/s the 1M corpus takes ~1.8 h; the 10k corpus took **63 s**.
+
+Embeddings are stored as headerless little-endian float32 with a JSON sidecar rather
+than `.npy`, because Rust reads them during index construction and the browser reads
+them at query time. A headerless matrix memory-maps from any language without a
+parser, and a byte range maps to rows by arithmetic alone — which is the whole point
+when the reader is fetching ranges over HTTP.
+
+### 5.4 Finding: dense retrieval is weak on random-word documents
+
+Exact (brute-force) cosine kNN over the 10k corpus, 1,000 queries. This is the
+*ceiling* for any dense ANN index on this corpus — an approximate index can only lose
+ground relative to it.
+
+| Query kind | k terms | success@1 | success@10 | success@100 | MRR |
+|---|---:|---:|---:|---:|---:|
+| known_item | 1 | 0.000 | 0.060 | 0.140 | 0.023 |
+| known_item | 2 | 0.040 | 0.180 | 0.310 | 0.086 |
+| known_item | 3 | 0.070 | 0.160 | 0.350 | 0.101 |
+| known_item | 5 | 0.080 | 0.310 | 0.590 | 0.164 |
+| known_item | 10 | 0.360 | 0.620 | 0.820 | 0.435 |
+
+Mean top-1 cosine is 0.448 against a mean median of 0.218 — the score barely
+discriminates. This is the expected result and not a bug: `all-MiniLM-L6-v2` was
+trained on natural sentences, and mean-pooling 50 mutually unrelated dictionary words
+produces a vector near the centroid of the embedding space. Fifty random words carry
+no topic for a topic model to encode.
+
+**Implication for the results matrix.** The random-word corpus remains a perfectly
+good benchmark for *index mechanics* — recall against exact search, page access
+patterns, round-trips, index size, build time — because those are measured against
+the same encoder's own exact ranking and so are unaffected by the encoder's semantic
+quality. But it cannot support an honest *end-to-end retrieval quality* comparison
+between lexical and dense retrieval: FTS5 matches query terms literally and will win
+by a wide margin, for reasons that say nothing about either system's behaviour on
+real text. Reporting that number as "dense loses to FTS5" would be misleading.
+
+Measuring quality therefore needs natural-language text. The LLM-written corpus that
+would have supplied it is out of scope (§1.1), so a substitute is needed; reachable
+options are recorded in §6.
+
+---
+
+## 6. Reachable corpus sources
+
+Re-probed after the §5.4 finding, since a natural-language corpus is now needed.
+
+| Source | Reachable | Notes |
+|---|---|---|
+| NLTK corpora (`raw.githubusercontent.com/nltk/nltk_data`) | **yes**, incl. byte ranges | brown, gutenberg, reuters, inaugural, europarl among ~100 packages |
+| Reuters-21578 (via NLTK) | **yes** | ships topic labels — genuine relevance judgments, not synthesised ones |
+| Python standard library on disk | yes | 672 `.py` files |
+| Rust crate sources in the cargo registry | yes | 1,968 `.rs` files |
+| `gutenberg.org`, `dumps.wikimedia.org` | no | 403 at the proxy |
+
+Reuters-21578 is the strongest candidate: it is a real IR benchmark whose documents
+are natural English and whose topic labels give relevance judgments that were not
+generated by the system under test. The local code corpora are the natural fit for
+`LateOn-Code-edge`, which is a code model.
+
+---
+
+## 7. Open items
 
 * **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
 * **Needed:** an emscripten toolchain for the WASM milestone.
