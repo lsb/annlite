@@ -49,5 +49,39 @@ console.log('resident search ->', got2.join(','), 'fetches', fetches);
 check('resident search matches the native result', got2.join(',') === db.expected.join(','));
 check('resident mode reads strictly fewer records', fetches < 299);
 
+
+// --- the resumable session must agree with the synchronous path ---
+// This is the API the browser demo uses, because sql.js-httpvfs is asynchronous
+// from the main thread. Each round of the loop is one network round-trip.
+function drive(index) {
+  const s = index.begin(q, 5, 32, 4);
+  let rounds = 0;
+  for (;;) {
+    const need = Array.from(s.next_request());
+    if (need.length === 0) break;
+    // Concatenate the requested records, as a batched range fetch would.
+    const buf = new Uint8Array(need.length * index.record_bytes);
+    need.forEach((id, i) => buf.set(recs[id], i * index.record_bytes));
+    s.supply(buf);
+    if (++rounds > 10000) throw new Error('session failed to terminate');
+  }
+  return { ids: Array.from(s.results()), hops: s.hops, nodes: s.nodes_read };
+}
+
+const sessionResident = drive(idx);
+check('resumable session matches the native result',
+      sessionResident.ids.join(',') === db.expected.join(','));
+console.log(`     resident session: ${sessionResident.hops} round-trips, ${sessionResident.nodes} records`);
+
+const idx2 = new a.Index(Uint8Array.from(db.codebook), db.dim, db.m, db.dsub, db.r, db.count, db.medoid);
+const sessionDisk = drive(idx2);
+check('resumable session matches in on-disk mode too',
+      sessionDisk.ids.join(',') === db.expected.join(','));
+console.log(`     on-disk session:  ${sessionDisk.hops} round-trips, ${sessionDisk.nodes} records`);
+check('resident mode needs no more round-trips than on-disk',
+      sessionResident.hops <= sessionDisk.hops);
+check('resident mode reads far fewer records',
+      sessionResident.nodes * 3 < sessionDisk.nodes);
+
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
 process.exit(failures ? 1 : 0);

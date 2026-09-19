@@ -251,3 +251,215 @@ impl Index {
         Ok(list.into_iter().take(k).map(|e| e.0).collect())
     }
 }
+
+/// A search paused between round-trips.
+///
+/// The synchronous [`Index::search`] needs a callback that can block, which only
+/// works inside a Web Worker. This drives the same traversal from the outside
+/// instead: it hands out the ids it needs, waits to be given the bytes, and steps
+/// forward. Three things fall out of that shape, and they are why it is the API the
+/// demo uses.
+///
+/// * It works with any asynchronous source — `sql.js-httpvfs` over a worker RPC,
+///   `fetch()` with a `Range` header, IndexedDB — without the traversal knowing.
+/// * Each request is a *batch*. A browser issues those in parallel up to its
+///   per-origin limit, so one round of the loop costs about one round-trip no
+///   matter how wide the frontier. That is exactly the distinction
+///   `tools/analyze/netcost.py` draws between dependent hops and parallel fetches.
+/// * The round-trip count stops being an estimate. [`SearchSession::hops`] is the
+///   number of times the caller had to go to the network, measured rather than
+///   modelled.
+#[wasm_bindgen]
+pub struct SearchSession {
+    table: ScoreTable,
+    m: usize,
+    r: usize,
+    count: usize,
+    codes: Option<Vec<u8>>,
+    k: usize,
+    l: usize,
+    beam: usize,
+    /// `(id, score, expanded)`, best first.
+    list: Vec<(u32, f32, bool)>,
+    seen: Vec<bool>,
+    /// Ids handed out by the last `next_request`, awaiting `supply`.
+    outstanding: Vec<u32>,
+    /// Whether the outstanding batch is being expanded or merely scored. A node
+    /// fetched only to read its code must not contribute its neighbours, or the
+    /// traversal explores a wider graph than the reference implementation and
+    /// returns different results.
+    outstanding_expands: bool,
+    /// Ids discovered but not yet scored, for the on-disk path.
+    unscored: Vec<u32>,
+    hops: usize,
+    nodes_read: usize,
+    started: bool,
+    done: bool,
+}
+
+#[wasm_bindgen]
+impl SearchSession {
+    /// Ids whose records the caller must supply next. Empty means finished.
+    pub fn next_request(&mut self) -> Vec<u32> {
+        if self.done {
+            return Vec::new();
+        }
+        if !self.started {
+            self.outstanding = vec![self.medoid_seed()];
+            self.outstanding_expands = true;
+            return self.outstanding.clone();
+        }
+        // On-disk mode scores by reading, so unscored discoveries come first. These
+        // are score-only fetches: their neighbours are not explored until and unless
+        // the node is later chosen for expansion.
+        if self.codes.is_none() && !self.unscored.is_empty() {
+            self.outstanding = std::mem::take(&mut self.unscored);
+            self.outstanding_expands = false;
+            return self.outstanding.clone();
+        }
+        let frontier: Vec<u32> = self
+            .list
+            .iter_mut()
+            .filter(|e| !e.2)
+            .take(self.beam)
+            .map(|e| {
+                e.2 = true;
+                e.0
+            })
+            .collect();
+        if frontier.is_empty() {
+            self.done = true;
+            return Vec::new();
+        }
+        self.outstanding = frontier.clone();
+        self.outstanding_expands = true;
+        frontier
+    }
+
+    fn medoid_seed(&self) -> u32 {
+        self.list.first().map(|e| e.0).unwrap_or(0)
+    }
+
+    /// Supply the records for the ids from the last [`SearchSession::next_request`],
+    /// concatenated in the same order.
+    pub fn supply(&mut self, records: &[u8]) -> Result<(), JsValue> {
+        let rec_len = self.m + 2 + self.r * 4;
+        let ids = std::mem::take(&mut self.outstanding);
+        if records.len() != ids.len() * rec_len {
+            return Err(JsValue::from_str(&format!(
+                "supplied {} bytes for {} records of {rec_len} bytes",
+                records.len(),
+                ids.len()
+            )));
+        }
+        self.hops += 1;
+        self.nodes_read += ids.len();
+
+        let expands = self.outstanding_expands;
+        for (slot, &id) in ids.iter().enumerate() {
+            let rec = &records[slot * rec_len..(slot + 1) * rec_len];
+            if !self.started {
+                self.started = true;
+                let score = self.score(id, rec);
+                self.list = vec![(id, score, false)];
+                self.seen[id as usize] = true;
+                continue;
+            }
+            if !self.list.iter().any(|e| e.0 == id) {
+                let score = self.score(id, rec);
+                self.list.push((id, score, false));
+            }
+            if !expands {
+                continue;
+            }
+            let deg = u16::from_le_bytes([rec[self.m], rec[self.m + 1]]) as usize;
+            for i in 0..deg.min(self.r) {
+                let o = self.m + 2 + i * 4;
+                let nb = u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
+                if (nb as usize) >= self.count || self.seen[nb as usize] {
+                    continue;
+                }
+                self.seen[nb as usize] = true;
+                match &self.codes {
+                    // Resident: score immediately, no further fetch needed.
+                    Some(c) => {
+                        let s = self
+                            .table
+                            .score(&c[nb as usize * self.m..(nb as usize + 1) * self.m]);
+                        self.list.push((nb, s, false));
+                    }
+                    // On disk: the score is in the record, so queue it for fetching.
+                    None => self.unscored.push(nb),
+                }
+            }
+        }
+        self.list.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        self.list.truncate(self.l);
+        Ok(())
+    }
+
+    fn score(&self, id: u32, rec: &[u8]) -> f32 {
+        match &self.codes {
+            Some(c) => self.table.score(&c[id as usize * self.m..(id as usize + 1) * self.m]),
+            None => self.table.score(&rec[..self.m]),
+        }
+    }
+
+    /// Best `k` ids so far, best first.
+    pub fn results(&self) -> Vec<u32> {
+        self.list.iter().take(self.k).map(|e| e.0).collect()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn finished(&self) -> bool {
+        self.done
+    }
+
+    /// Network round-trips taken. Measured, not modelled.
+    #[wasm_bindgen(getter)]
+    pub fn hops(&self) -> usize {
+        self.hops
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn nodes_read(&self) -> usize {
+        self.nodes_read
+    }
+}
+
+#[wasm_bindgen]
+impl Index {
+    /// Begin a search driven from JavaScript, one round-trip at a time.
+    pub fn begin(
+        &self,
+        query: &[f32],
+        k: usize,
+        l: usize,
+        beam: usize,
+    ) -> Result<SearchSession, JsValue> {
+        if query.len() != self.pq.dim {
+            return Err(JsValue::from_str("query dimension does not match the index"));
+        }
+        let mut list = Vec::new();
+        list.push((self.medoid, 0.0, false));
+        Ok(SearchSession {
+            table: self.pq.score_table(query),
+            m: self.pq.m,
+            r: self.r,
+            count: self.count,
+            codes: self.codes.clone(),
+            k: k.max(1),
+            l: l.max(k).max(1),
+            beam: beam.max(1),
+            list,
+            seen: vec![false; self.count],
+            outstanding: Vec::new(),
+            outstanding_expands: false,
+            unscored: Vec::new(),
+            hops: 0,
+            nodes_read: 0,
+            started: false,
+            done: false,
+        })
+    }
+}

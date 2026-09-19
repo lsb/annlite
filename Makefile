@@ -124,3 +124,22 @@ tokenizer-parity: $(CORPUS)/docs-10k.txt
 	@diff -q /tmp/annlite-tok-rust.txt /tmp/annlite-tok-py.txt >/dev/null \
 	  && echo "tokenizers agree on $$(wc -l < /tmp/annlite-tok-sample.txt) lines" \
 	  || { echo "TOKENIZERS DISAGREE:"; diff /tmp/annlite-tok-rust.txt /tmp/annlite-tok-py.txt | head; exit 1; }
+
+# --- Browser demo ----------------------------------------------------------
+DEMO_DIR  := web/demo
+DEMO_DOCS ?= 2000
+
+.PHONY: demo demo-serve
+
+demo: wasm $(CORPUS)/docs-10k.txt
+	$(CARGO) run --release -p annlite-sqlite --example build_demo -- $(DEMO_DOCS) $(DEMO_DIR)/annlite-demo.db
+	wasm-bindgen --target web --out-dir $(DEMO_DIR)/vendor/annlite \
+	  target/$(WASM_TARGET)/release/annlite_wasm.wasm
+	$(PYTHON) tools/analyze/demo_queries.py
+	@echo "demo built -- run 'make demo-serve' and open http://127.0.0.1:8099/index.html"
+
+# Served through the network simulator so the page can report real HTTP costs from
+# the server's own counters rather than guessing at them.
+demo-serve:
+	./target/release/annlite-netsim --root $(DEMO_DIR) --addr 127.0.0.1:8099 \
+	  --profile $(or $(PROFILE),ideal) --log /tmp/annlite-netsim.jsonl
