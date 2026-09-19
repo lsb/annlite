@@ -18,6 +18,8 @@ fn mini_corpus(dir: &std::path::Path) -> std::path::PathBuf {
     // As `tools/corpus/code.py` writes them: one function per line, newlines escaped.
     writeln!(f, r"def load_module(name):\n    return _bootstrap(name)").unwrap();
     writeln!(f, r"def unrelated(x):\n    return x + 1").unwrap();
+    // Shares both `load` and `module` with the query below, but not adjacently.
+    writeln!(f, r"def helper():\n    return module_load_order").unwrap();
     path
 }
 
@@ -45,27 +47,29 @@ fn an_escaped_corpus_is_indexed_as_the_source_it_encodes() {
     let decoded = dir.join("decoded.db");
     index::build(&escaped, &corpus, CorpusFormat::Words, false).unwrap();
     let report = index::build(&decoded, &corpus, CorpusFormat::Code, false).unwrap();
-    assert_eq!(report.n_docs, 2);
+    assert_eq!(report.n_docs, 3);
 
-    // `...(name):\n    return ...` tokenizes as `name`, `nreturn` while the escape is
-    // left in place, so the word `return` is simply not in the index. This is the
-    // failure the flag exists to prevent, and it is invisible in every other statistic.
+    // Left encoded, every line break contributes a spurious `n` token. It is one
+    // token per newline in a document of a few dozen, and BM25 divides by document
+    // length, so it shifts every score while changing nothing a reader would notice.
     let c = Connection::open(&escaped).unwrap();
-    assert!(hits(&c, "return", query::TermSplit::Alphanumeric).is_empty());
-    assert_eq!(hits(&c, "nreturn", query::TermSplit::Alphanumeric).len(), 2);
+    assert_eq!(hits(&c, "n", query::TermSplit::Alphanumeric).len(), 3);
     drop(c);
 
     let c = Connection::open(&decoded).unwrap();
-    assert_eq!(hits(&c, "return", query::TermSplit::Alphanumeric).len(), 2);
-    assert!(hits(&c, "nreturn", query::TermSplit::Alphanumeric).is_empty());
+    assert!(hits(&c, "n", query::TermSplit::Alphanumeric).is_empty());
+    assert_eq!(hits(&c, "return", query::TermSplit::Alphanumeric).len(), 3);
 
-    // A docstring, asked as a docstring: punctuation is dropped and `load_module`
-    // splits the way the tokenizer split it in the document, so the right function
-    // ranks first. Whitespace splitting would search for the literal term
-    // `find_module().` and match nothing.
-    let text = "**DEPRECATED** Load a module, given information returned by load_module().";
-    assert_eq!(hits(&c, text, query::TermSplit::Alphanumeric).first(), Some(&0));
-    assert!(hits(&c, text, query::TermSplit::Whitespace).is_empty());
+    // A docstring, asked as a docstring. Splitting on whitespace quotes
+    // `load_module().`, which FTS5 reads as the phrase `load module` — so only the
+    // document with those tokens adjacent stays a candidate, and `module load helper`
+    // drops out although it shares both terms. Splitting on non-alphanumerics keeps
+    // both, which is what lets BM25 rank partial matches.
+    let text = "Load a module, given information returned by load_module().";
+    let mut both = hits(&c, text, query::TermSplit::Alphanumeric);
+    both.sort_unstable();
+    assert_eq!(both, vec![0, 2], "candidate set, not ranking: BM25 decides the order");
+    assert_eq!(hits(&c, text, query::TermSplit::Whitespace), vec![0]);
     drop(c);
 
     // Both databases are still well-formed FTS5 at the project's page size; the
