@@ -7,5 +7,7 @@
 //! possible search path.
 
 pub mod hnsw;
+pub mod layout;
 pub mod pq;
+pub mod vamana;
 pub mod vectors;

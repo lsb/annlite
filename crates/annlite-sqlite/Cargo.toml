@@ -1,0 +1,15 @@
+[package]
+name = "annlite-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite storage format for annlite vector indexes, laid out for page locality"
+
+[dependencies]
+annlite-core = { path = "../annlite-core" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }

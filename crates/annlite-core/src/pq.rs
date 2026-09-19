@@ -271,3 +271,30 @@ fn kmeans(data: &[f32], n: usize, d: usize, k: usize, iters: usize, seed: u64) -
     }
     centroids
 }
+
+/// Cluster whole vectors (not subspaces) and return each vector's cluster id.
+///
+/// Used by the layout module to group similar documents onto the same page. This is
+/// the same Lloyd's implementation the codebook training uses, applied to the full
+/// dimension rather than a subspace.
+pub fn kmeans_assign(vectors: &Vectors, k: usize, iters: usize, seed: u64) -> Vec<u32> {
+    let n = vectors.len();
+    let d = vectors.dim;
+    let k = k.min(n).max(1);
+    let centroids = kmeans(&vectors.data, n, d, k, iters, seed);
+    (0..n)
+        .map(|i| {
+            let p = vectors.row(i);
+            let mut best = 0u32;
+            let mut best_d = f32::INFINITY;
+            for c in 0..k {
+                let dist = sqeuclidean(p, &centroids[c * d..(c + 1) * d]);
+                if dist < best_d {
+                    best_d = dist;
+                    best = c as u32;
+                }
+            }
+            best
+        })
+        .collect()
+}
