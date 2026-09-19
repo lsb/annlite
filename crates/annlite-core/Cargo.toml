@@ -10,3 +10,4 @@ description = "Vector index algorithms for annlite: PQ, HNSW, Vamana/DiskANN, la
 anyhow.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+rayon = "1"

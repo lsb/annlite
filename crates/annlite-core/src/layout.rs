@@ -93,8 +93,29 @@ pub fn bfs_order(n: usize, start: u32, neighbors: impl Fn(u32) -> Vec<u32>) -> P
 
 /// Cluster order: assign each vector to the nearest of `k` centroids found by
 /// k-means, then list clusters largest first with members contiguous.
+///
+/// `train_sample` caps how many vectors the centroids are fitted on. Lloyd's
+/// algorithm costs `n * k * dim` per iteration, so at a million vectors and the
+/// thousands of clusters this ordering wants, fitting on all of them is hours of
+/// work for centroids that a sample determines just as well. Every vector is still
+/// assigned, so the ordering covers the whole corpus.
+pub fn cluster_order_sampled(
+    vectors: &Vectors,
+    k: usize,
+    iters: usize,
+    seed: u64,
+    train_sample: usize,
+) -> Permutation {
+    let assign = crate::pq::kmeans_assign_sampled(vectors, k, iters, seed, train_sample);
+    bucket(assign, k)
+}
+
 pub fn cluster_order(vectors: &Vectors, k: usize, iters: usize, seed: u64) -> Permutation {
     let assign = crate::pq::kmeans_assign(vectors, k, iters, seed);
+    bucket(assign, k)
+}
+
+fn bucket(assign: Vec<u32>, k: usize) -> Permutation {
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); k];
     for (i, &c) in assign.iter().enumerate() {
         buckets[c as usize].push(i as u32);

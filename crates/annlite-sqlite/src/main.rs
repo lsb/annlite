@@ -6,7 +6,7 @@
 //! orderings, so any difference in pages touched is attributable to node numbering
 //! alone -- which is the claim being tested.
 
-use annlite_core::layout::{bfs_order, cluster_order, Ordering, Permutation};
+use annlite_core::layout::{bfs_order, cluster_order_sampled, Ordering, Permutation};
 use annlite_core::pq::ProductQuantizer;
 use annlite_core::vamana::{Vamana, VamanaParams};
 use annlite_core::vectors::{exact_top_k, Vectors};
@@ -48,6 +48,9 @@ struct Cli {
     db_dir: PathBuf,
     #[arg(long, default_value = "bench/results")]
     out_dir: PathBuf,
+    /// Batch size for the parallel graph build; 0 builds sequentially.
+    #[arg(long, default_value_t = 1024)]
+    build_batch: usize,
     /// Train PQ on at most this many vectors; 0 uses all of them.
     #[arg(long, default_value_t = 100_000)]
     pq_train: usize,
@@ -58,6 +61,12 @@ struct Cli {
     beams: Vec<usize>,
     #[arg(long, value_delimiter = ',', default_value = "32,64,128")]
     search_l: Vec<usize>,
+    /// Node orderings to compare: identity, bfs, cluster.
+    #[arg(long, value_delimiter = ',', default_value = "identity,bfs,cluster")]
+    orderings: Vec<String>,
+    /// Fit cluster-ordering centroids on at most this many vectors.
+    #[arg(long, default_value_t = 100_000)]
+    cluster_train: usize,
 }
 
 fn main() -> Result<()> {
@@ -98,10 +107,12 @@ fn main() -> Result<()> {
 
     eprintln!("building Vamana (R={} alpha={} L={})...", cli.r, cli.alpha, cli.l_build);
     let t0 = std::time::Instant::now();
-    let graph = Vamana::build(
-        &docs,
-        VamanaParams { r: cli.r, l_build: cli.l_build, alpha: cli.alpha, seed: 0xDA7A },
-    );
+    let vparams = VamanaParams { r: cli.r, l_build: cli.l_build, alpha: cli.alpha, seed: 0xDA7A };
+    let graph = if cli.build_batch > 0 {
+        Vamana::build_parallel(&docs, vparams, cli.build_batch)
+    } else {
+        Vamana::build(&docs, vparams)
+    };
     let build_s = t0.elapsed().as_secs_f64();
     let gs = graph.stats();
     eprintln!("  built in {build_s:.1}s, mean degree {:.1}, orphans {}", gs.mean_degree, gs.orphans);
@@ -112,6 +123,7 @@ fn main() -> Result<()> {
         "record": "meta", "scale": cli.scale, "docs": docs.len(), "queries": n_q,
         "dim": cli.dim, "m": cli.m, "r": cli.r, "alpha": cli.alpha, "l_build": cli.l_build,
         "pq_train_vectors": train.len(), "pq_train_seconds": pq_train_s,
+        "build_batch": cli.build_batch,
         "vamana_build_seconds": build_s, "mean_degree": gs.mean_degree, "orphans": gs.orphans,
         "exact_ms_per_query": exact_ms,
     }))?;
@@ -121,7 +133,18 @@ fn main() -> Result<()> {
              "hops", "ms");
     println!("{}", "-".repeat(101));
 
-    for ordering in [Ordering::Identity, Ordering::Bfs, Ordering::Cluster] {
+    let chosen: Vec<Ordering> = cli
+        .orderings
+        .iter()
+        .map(|s| match s.to_lowercase().as_str() {
+            "identity" => Ok(Ordering::Identity),
+            "bfs" => Ok(Ordering::Bfs),
+            "cluster" => Ok(Ordering::Cluster),
+            other => Err(anyhow::anyhow!("unknown ordering {other}")),
+        })
+        .collect::<Result<_>>()?;
+
+    for ordering in chosen {
         let perm = match ordering {
             Ordering::Identity => Permutation::identity(docs.len()),
             Ordering::Bfs => bfs_order(docs.len(), graph.medoid, |n| graph.neighbors(n).to_vec()),
@@ -129,16 +152,18 @@ fn main() -> Result<()> {
                 // Roughly one cluster per page's worth of records, so a cluster is
                 // about the granularity a single fetch can deliver.
                 let k = (docs.len() / 64).clamp(2, 4096);
-                cluster_order(&docs, k, 10, 19)
+                cluster_order_sampled(&docs, k, 10, 19, cli.cluster_train)
             }
         };
 
+        let t_perm = std::time::Instant::now();
         let db_path = cli.db_dir.join(format!("ann-{}-{:?}.db", cli.scale, ordering).to_lowercase());
+        eprintln!("  {:?} ordering computed in {:.1}s", ordering, t_perm.elapsed().as_secs_f64());
         let _ = std::fs::remove_file(&db_path);
         let mut conn = Connection::open(&db_path)?;
-        let t0 = std::time::Instant::now();
+        let t_write = std::time::Instant::now();
         let meta = write_index(&mut conn, &graph, &pq, &codes, &docs, &perm, ordering, None)?;
-        let write_s = t0.elapsed().as_secs_f64();
+        let write_s = t_write.elapsed().as_secs_f64();
         let (node_pages, per_page) = node_page_stats(&conn)?;
         let db_bytes = std::fs::metadata(&db_path)?.len();
 

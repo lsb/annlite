@@ -172,3 +172,38 @@ fn access_cost_counts_runs_correctly() {
     assert_eq!(c.contiguous_runs, 2, "pages 0-1 form one run, page 5 another");
     assert_eq!(access_cost(&[], &perm, layout).contiguous_runs, 0);
 }
+
+#[test]
+fn parallel_build_matches_sequential_quality() {
+    // The parallel build lets a batch of searches see the graph as it was at the
+    // start of the batch, so it is an approximation, not a reproduction. What must
+    // hold is that the approximation does not cost recall.
+    let v = clustered(3000, 64, 60, 31);
+    let q = clustered(60, 64, 60, 313);
+    let p = VamanaParams { r: 32, l_build: 64, alpha: 1.1, seed: 41 };
+
+    let seq = Vamana::build(&v, p);
+    let par = Vamana::build_parallel(&v, p, 256);
+
+    let (rs, rp) = (recall_at_10(&seq, &v, &q, 64), recall_at_10(&par, &v, &q, 64));
+    assert!(rp > 0.85, "parallel build recall fell to {rp}");
+    assert!(
+        (rs - rp).abs() < 0.05,
+        "parallel build diverged from sequential: {rp} against {rs}"
+    );
+    assert_eq!(par.stats().orphans, 0);
+    assert!(par.stats().max_degree <= 32);
+}
+
+#[test]
+fn parallel_build_is_deterministic() {
+    // Batches are applied in a fixed order, so the result must not depend on how
+    // rayon happened to schedule the searches within a batch.
+    let v = clustered(800, 32, 16, 5);
+    let p = VamanaParams { r: 16, l_build: 32, alpha: 1.1, seed: 3 };
+    let a = Vamana::build_parallel(&v, p, 128);
+    let b = Vamana::build_parallel(&v, p, 128);
+    for i in 0..v.len() as u32 {
+        assert_eq!(a.neighbors(i), b.neighbors(i), "node {i} differs between runs");
+    }
+}

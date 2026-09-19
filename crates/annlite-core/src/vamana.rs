@@ -58,10 +58,33 @@ pub struct Vamana {
     /// and so gives greedy descent a neutral start regardless of query direction.
     pub medoid: u32,
     n: usize,
-    /// Visit stamps reused across searches. Construction runs one search per node
-    /// per pass, so allocating and zeroing an n-element buffer each time would make
-    /// the build quadratic in the corpus size before a single distance was computed.
-    stamp: std::cell::RefCell<(Vec<u32>, u32)>,
+}
+
+/// Visit stamps reused across searches.
+///
+/// Construction runs one search per node per pass, so allocating and zeroing an
+/// n-element buffer each time would make the build quadratic in the corpus size
+/// before a single distance was computed. Bumping a generation counter makes the
+/// reset free. It is an explicit argument rather than interior state so that several
+/// searches can run on different threads over the same immutable graph.
+pub struct Scratch {
+    seen: Vec<u32>,
+    generation: u32,
+}
+
+impl Scratch {
+    pub fn new(n: usize) -> Self {
+        Self { seen: vec![0; n], generation: 0 }
+    }
+
+    fn begin(&mut self) -> u32 {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.seen.iter_mut().for_each(|s| *s = 0);
+            self.generation = 1;
+        }
+        self.generation
+    }
 }
 
 impl Vamana {
@@ -76,7 +99,6 @@ impl Vamana {
             deg: vec![0; n],
             medoid: medoid(vectors),
             n,
-            stamp: std::cell::RefCell::new((vec![0u32; n], 0)),
         };
         idx.random_init(&mut ChaCha8Rng::seed_from_u64(params.seed));
 
@@ -89,9 +111,71 @@ impl Vamana {
         // Pass 1 at alpha = 1.0 turns the random graph into a navigable one; pass 2
         // at the configured alpha re-prunes it, which is only meaningful once
         // neighbourhoods carry information.
+        let mut scratch = Scratch::new(n);
         for &alpha in &[1.0f32, params.alpha.max(1.0)] {
             for &p in &order {
-                idx.insert_pass(vectors, p, alpha);
+                idx.insert_pass(vectors, p, alpha, &mut scratch);
+            }
+        }
+        idx
+    }
+
+    /// Build with the greedy searches run in parallel.
+    ///
+    /// Insertion is inherently sequential -- each node's neighbours depend on the
+    /// graph as it stands -- but the *search* half is read-only, and it is where the
+    /// time goes. Nodes are therefore processed in batches: every search in a batch
+    /// runs concurrently against the graph as it was at the start of the batch, then
+    /// the pruning and edge installation are applied one node at a time.
+    ///
+    /// The approximation is that a node early in a batch does not see edges added by
+    /// a node later in the same batch. Smaller batches approach the sequential build
+    /// exactly; `batch` is exposed so that trade is explicit rather than hidden.
+    /// Both passes still run, and the second pass re-prunes against the finished
+    /// first-pass graph, which absorbs most of the difference.
+    pub fn build_parallel(vectors: &Vectors, params: VamanaParams, batch: usize) -> Self {
+        use rayon::prelude::*;
+
+        let n = vectors.len();
+        assert!(n > 0, "cannot build over an empty set");
+        let r = params.r.min(n.saturating_sub(1)).max(1);
+        let mut idx = Self {
+            params: VamanaParams { r, ..params },
+            adj: vec![u32::MAX; n * r],
+            deg: vec![0; n],
+            medoid: medoid(vectors),
+            n,
+        };
+        idx.random_init(&mut ChaCha8Rng::seed_from_u64(params.seed));
+
+        let mut rng = ChaCha8Rng::seed_from_u64(params.seed ^ 0xABCD);
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.gen_range(0..=i));
+        }
+
+        let batch = batch.max(1);
+        for &alpha in &[1.0f32, params.alpha.max(1.0)] {
+            for chunk in order.chunks(batch) {
+                let found: Vec<(u32, Vec<u32>)> = chunk
+                    .par_iter()
+                    .map_init(
+                        || Scratch::new(n),
+                        |scratch, &p| {
+                            let (_, visited) = idx.greedy_search_with(
+                                vectors,
+                                vectors.row(p as usize),
+                                1,
+                                params.l_build,
+                                scratch,
+                            );
+                            (p, visited)
+                        },
+                    )
+                    .collect();
+                for (p, visited) in found {
+                    idx.apply(vectors, p, visited, alpha);
+                }
             }
         }
         idx
@@ -114,9 +198,16 @@ impl Vamana {
         }
     }
 
-    fn insert_pass(&mut self, vectors: &Vectors, p: u32, alpha: f32) {
-        let (_, visited) = self.greedy_search(vectors, vectors.row(p as usize), 1, self.params.l_build);
+    fn insert_pass(&mut self, vectors: &Vectors, p: u32, alpha: f32, scratch: &mut Scratch) {
+        let (_, visited) =
+            self.greedy_search_with(vectors, vectors.row(p as usize), 1, self.params.l_build, scratch);
+        self.apply(vectors, p, visited, alpha);
+    }
 
+    /// Prune `p`'s candidate set and install the resulting edges, including the
+    /// back-edges. Separated from the search so a batch of searches can run in
+    /// parallel and their results be applied one at a time.
+    fn apply(&mut self, vectors: &Vectors, p: u32, visited: Vec<u32>, alpha: f32) {
         let mut candidates: Vec<u32> = visited.into_iter().filter(|&v| v != p).collect();
         candidates.extend(self.neighbors(p).iter().copied().filter(|&v| v != p));
         candidates.sort_unstable();
@@ -177,17 +268,24 @@ impl Vamana {
         k: usize,
         l: usize,
     ) -> (Vec<(u32, f32)>, Vec<u32>) {
+        let mut scratch = Scratch::new(self.n);
+        self.greedy_search_with(vectors, query, k, l, &mut scratch)
+    }
+
+    /// As [`Vamana::greedy_search`], reusing a caller-owned scratch buffer.
+    pub fn greedy_search_with(
+        &self,
+        vectors: &Vectors,
+        query: &[f32],
+        k: usize,
+        l: usize,
+        scratch: &mut Scratch,
+    ) -> (Vec<(u32, f32)>, Vec<u32>) {
         let l = l.max(k).max(1);
         let mut list: Vec<(u32, f32, bool)> =
             vec![(self.medoid, distance(query, vectors.row(self.medoid as usize)), false)];
-        let mut stamp = self.stamp.borrow_mut();
-        let (seen, gen) = &mut *stamp;
-        *gen = gen.wrapping_add(1);
-        if *gen == 0 {
-            seen.iter_mut().for_each(|s| *s = 0);
-            *gen = 1;
-        }
-        let generation = *gen;
+        let generation = scratch.begin();
+        let seen = &mut scratch.seen;
         seen[self.medoid as usize] = generation;
         let mut visited = Vec::new();
 

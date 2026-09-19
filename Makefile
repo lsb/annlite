@@ -143,3 +143,17 @@ demo: wasm $(CORPUS)/docs-10k.txt
 demo-serve:
 	./target/release/annlite-netsim --root $(DEMO_DIR) --addr 127.0.0.1:8099 \
 	  --profile $(or $(PROFILE),ideal) --log /tmp/annlite-netsim.jsonl
+
+# --- Code-search corpus ----------------------------------------------------
+# A code model cannot be evaluated on bags of dictionary words, so this builds the
+# docstring-to-code benchmark from the local Python standard library. Ground truth
+# is the corpus construction itself: a docstring's own function.
+.PHONY: code-corpus code-eval
+
+code-corpus: $(CORPUS)/code-docs.txt
+$(CORPUS)/code-docs.txt:
+	$(PYTHON) -m tools.corpus.code --out-dir $(CORPUS)
+
+code-eval: code-corpus
+	$(PYTHON) tools/analyze/code_eval.py $(or $(NQ),500)
+	$(CARGO) run --release -p annlite-core --example late_eval

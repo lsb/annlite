@@ -113,11 +113,15 @@ impl ProductQuantizer {
     }
 
     /// Encode a whole matrix into a packed `n * m` byte array.
+    ///
+    /// Encoding is per-row independent, so at a million documents -- where this is
+    /// tens of billions of operations -- it is run across all cores.
     pub fn encode_all(&self, vectors: &Vectors) -> Vec<u8> {
+        use rayon::prelude::*;
         let mut out = vec![0u8; vectors.len() * self.m];
-        for (i, row) in vectors.rows().enumerate() {
-            self.encode_into(row, &mut out[i * self.m..(i + 1) * self.m]);
-        }
+        out.par_chunks_mut(self.m).enumerate().for_each(|(i, slot)| {
+            self.encode_into(vectors.row(i), slot);
+        });
         out
     }
 
@@ -278,11 +282,41 @@ fn kmeans(data: &[f32], n: usize, d: usize, k: usize, iters: usize, seed: u64) -
 /// the same Lloyd's implementation the codebook training uses, applied to the full
 /// dimension rather than a subspace.
 pub fn kmeans_assign(vectors: &Vectors, k: usize, iters: usize, seed: u64) -> Vec<u32> {
+    kmeans_assign_sampled(vectors, k, iters, seed, 0)
+}
+
+/// As [`kmeans_assign`], fitting centroids on at most `train_sample` vectors.
+///
+/// Lloyd's algorithm costs `n * k * dim` per iteration, so at a million vectors and
+/// thousands of clusters, fitting on all of them is hours of work for centroids that
+/// a sample determines just as well. Every vector is still assigned afterwards, so
+/// the result covers the whole corpus. The sample is taken by stride, which keeps it
+/// deterministic and spreads it across the corpus rather than favouring its start.
+pub fn kmeans_assign_sampled(
+    vectors: &Vectors,
+    k: usize,
+    iters: usize,
+    seed: u64,
+    train_sample: usize,
+) -> Vec<u32> {
+    use rayon::prelude::*;
     let n = vectors.len();
     let d = vectors.dim;
     let k = k.min(n).max(1);
-    let centroids = kmeans(&vectors.data, n, d, k, iters, seed);
+    let centroids = if train_sample > 0 && train_sample < n {
+        let stride = (n / train_sample).max(1);
+        let mut sample = Vec::with_capacity(train_sample * d);
+        for i in (0..n).step_by(stride).take(train_sample) {
+            sample.extend_from_slice(vectors.row(i));
+        }
+        let rows = sample.len() / d;
+        kmeans(&sample, rows, d, k, iters, seed)
+    } else {
+        kmeans(&vectors.data, n, d, k, iters, seed)
+    };
+
     (0..n)
+        .into_par_iter()
         .map(|i| {
             let p = vectors.row(i);
             let mut best = 0u32;

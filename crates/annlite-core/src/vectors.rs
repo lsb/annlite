@@ -72,8 +72,10 @@ pub fn sqeuclidean(a: &[f32], b: &[f32]) -> f32 {
 /// approximate index is scored against, so it is deliberately the dumbest possible
 /// implementation: nothing here should be clever enough to be wrong.
 pub fn exact_top_k(vectors: &Vectors, query: &[f32], k: usize) -> Vec<(u32, f32)> {
+    use rayon::prelude::*;
     let mut scored: Vec<(u32, f32)> = vectors
-        .rows()
+        .data
+        .par_chunks_exact(vectors.dim)
         .enumerate()
         .map(|(i, r)| (i as u32, dot(query, r)))
         .collect();
