@@ -1,0 +1,11 @@
+/target
+.venv/
+__pycache__/
+*.pyc
+
+# Generated corpora and built databases are reproducible from `make`.
+# See RESEARCH_LOG.md "Reproducibility" for why these are not committed.
+/data/corpus/
+/data/embeddings/
+/data/db/
+/bench/results/*.jsonl

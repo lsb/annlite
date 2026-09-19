@@ -1,0 +1,12 @@
+[package]
+name = "annlite-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vector index algorithms for annlite: PQ, HNSW, Vamana/DiskANN, late interaction"
+
+[dependencies]
+anyhow.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true

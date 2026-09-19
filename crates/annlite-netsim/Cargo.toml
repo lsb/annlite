@@ -1,0 +1,15 @@
+[package]
+name = "annlite-netsim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP byte-range server with configurable latency and throughput simulation"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
