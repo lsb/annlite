@@ -1127,6 +1127,7 @@ parameters within each scale.
 |---:|---:|---:|---:|---:|---:|---:|
 | 10,000 | 978.0 | 420.5 | **280.4** | 355.7 | 49.0 | 64.8 |
 | 100,000 | 1,291.1 | 1,135.3 | **659.5** | 916.3 | 861.3 | **355.4** |
+| 1,000,000 | 1,543.5 | 1,518.9 | **994.0** | 1,384.4 | 1,470.0 | **755.7** |
 
 At 10,000 documents BFS ordering cuts pages by a third but *raises* the coalesced
 request count, 49.0 to 64.8. That is not a contradiction: a query there touches most
@@ -1140,11 +1141,23 @@ And with codes resident, which changes *when* records are read rather than which
 | scale | records (on disk) | records (resident) | pages (BFS, on disk) | pages (BFS, resident) | requests (BFS, resident) |
 |---:|---:|---:|---:|---:|---:|
 | 10,000 | 978.0 | 44.9 | 280.4 | 37.1 | 30.7 |
-| 100,000 | 1,291.1 | **51.9** | 659.5 | **44.9** | **41.2** |
+| 100,000 | 1,291.1 | 51.9 | 659.5 | 44.9 | 41.2 |
+| 1,000,000 | 1,543.5 | **59.2** | 994.0 | **50.6** | **47.3** |
+
+Records read grows only from 978 to 1,543 across a hundredfold increase in corpus
+size — the graph is doing its job. What grows is the number of *pages* those records
+are scattered over, from 421 to 1,519 under insertion order, which is the cost
+ordering and residency exist to attack.
 
 Recall is identical to three decimals in every resident/on-disk pair and across all
 three orderings, as it must be: the same nodes are scored either way, and a test
 pins it (`ordering_changes_pages_but_not_results`).
+
+**At a million documents both levers hold and compose.** Breadth-first ordering takes
+pages from 1,519 to 994 and coalesced requests from 1,470 to 756; resident codes take
+records read from 1,543 to 59. Together, **1,470 requests become 47 — a factor of
+31** — at recall identical to three decimals. Cluster ordering again lands between
+insertion order and BFS.
 
 **Ordering pays more as the corpus grows.** At 10,000 documents a query touched most
 of the node table, so BFS ordering cut pages by a third while leaving requests no
@@ -1177,17 +1190,37 @@ and is pure loss for a single one.
 
 ### 16.3 Against the baseline
 
-FTS5 at a million documents costs 1,537 pages and 6.1 MB for a median query — **111
-seconds on `lte`, 925 on satellite** (section 9.3). Those are the numbers the dense
-index exists to beat, and at 100,000 documents the best dense configuration answers
-in **842 ms on `lte`** at recall 0.262, or **3.9 s** at recall 0.434 with reranking.
+Both now measured at the same scale. A median FTS5 query at a million documents
+costs 1,537 pages and 6.1 MB; the dense index at the same scale, breadth-first with
+resident codes, costs 82 pages and 79 requests.
 
-The comparison is not yet like-for-like — different scales, and different notions of
-a correct answer — but the shape is clear: FTS5's cost is dominated by a per-match
-random lookup that grows with the number of matches, while the graph index's cost is
-dominated by a fixed number of hops that grows only with the logarithm of the corpus.
-At a hundred thousand documents that difference is already two orders of magnitude,
-and it is the whole argument for the project.
+| system (1M documents) | pages | requests | `lte` | `3g` | satellite |
+|---|---:|---:|---:|---:|---:|
+| FTS5 | 1,537 | 630 | **111 s** | 339 s | 925 s |
+| dense, insertion order, on disk | 1,551 | 1,502 | 21.0 s | 82.2 s | 154 s |
+| dense, BFS, on disk | 1,026 | 787 | 12.3 s | 49.8 s | 88.1 s |
+| **dense, BFS, resident** | **82** | **79** | **1.4 s** | **5.3 s** | **10.9 s** |
+
+**79x faster than the baseline on `lte`, 85x on satellite.** The mechanism is the one
+section 9.4 identified: FTS5's cost is a per-match random lookup that grows with the
+number of matches, while the graph index's cost is a hop count that grows with the
+logarithm of the corpus. Records read rose only 978 to 1,543 from ten thousand
+documents to a million.
+
+Two things this table does **not** say, and both matter.
+
+*It is not a quality comparison.* Recall@10 here runs 0.213 to 0.366 while FTS5
+scores 0.760 success@1 on the same corpus. Dense retrieval loses badly on
+random-word documents, for the reason established in section 5.4: MiniLM embeddings
+of fifty unrelated dictionary words sit in a narrow cone with almost no
+discrimination. This is a cost result. The quality comparison lives on the code
+corpus (section 15.1), where late interaction reaches 0.454 against BM25's 0.280.
+
+*The preload is not free.* The resident row excludes a 64 MB code blob, which on
+`lte` is 34 seconds. For a single query the on-disk variant wins on wifi, `lte` and
+`3g`; resident wins from about ten queries onward, and by a hundred it is not close.
+The session tables in `docs/RESULTS.md` carry the crossover for every profile. Even
+counting the preload in full, one query costs 35 s against the baseline's 111 s.
 
 ---
 

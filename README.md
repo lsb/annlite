@@ -40,6 +40,20 @@ FTS5 at a million documents, measured with a pass-through VFS that agreed with
 | 10,000 | 26 | 104 | 1.9 s |
 | **1,000,000** | **1,537** | **6,148** | **111 s** |
 
+Head to head at a million documents, same corpus, same queries:
+
+| system | pages | requests | `lte` | satellite |
+|---|---:|---:|---:|---:|
+| FTS5 | 1,537 | 630 | 111 s | 925 s |
+| dense, insertion order, on disk | 1,551 | 1,502 | 21.0 s | 154 s |
+| **dense, BFS, resident codes** | **82** | **79** | **1.4 s** | **10.9 s** |
+
+**79x faster than the baseline on `lte`.** Two caveats that belong with the number:
+this is a *cost* result, not a quality one — recall on this corpus is 0.213–0.366
+against FTS5's 0.760, because embeddings of fifty random dictionary words barely
+discriminate — and the resident row excludes a 64 MB preload that takes 34 s on
+`lte`, so on-disk wins for a single query and resident wins from about ten onward.
+
 And the cost is the *ranking function*, not the index. Re-running without
 `ORDER BY bm25()` costs 19.8 pages against 1,557.6 — a **79x** difference — because
 FTS5 does one random `%_docsize` lookup per match. That is the lesson the record
@@ -58,6 +72,11 @@ parameters within each scale, so differences are attributable to layout alone.
 |---:|---:|---:|---:|---:|---:|
 | 10,000 | 978 | 421 | 280 | 49 | 65 |
 | 100,000 | 1,291 | 1,135 | **660** | 861 | **355** |
+| 1,000,000 | 1,544 | 1,519 | **994** | 1,470 | **756** |
+
+Records read grows only 978 → 1,544 across a hundredfold increase in corpus size —
+the graph is doing its job. What grows is how many *pages* those records scatter
+over, which is what ordering and residency attack.
 
 Making the PQ codes **resident** — one bulk download, after which a record is read
 only for a node the search *expands* — is the larger and independent lever:
@@ -65,7 +84,10 @@ only for a node the search *expands* — is the larger and independent lever:
 | scale | records (on disk) | records (resident) | requests (BFS + resident) |
 |---:|---:|---:|---:|
 | 10,000 | 978 | 45 | 31 |
-| 100,000 | 1,291 | **52** | **41** |
+| 100,000 | 1,291 | 52 | 41 |
+| 1,000,000 | 1,544 | **59** | **47** |
+
+At a million documents the two levers compose to turn **1,470 requests into 47**.
 
 Recall is identical to three decimals in every pair, as it must be — the same nodes
 are scored either way, and a test pins it.

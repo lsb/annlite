@@ -196,13 +196,84 @@ this one includes it, which is the comparison that decides the design.
 | `3g` | 36.3 s (resident) | 72.8 s (resident) | 438 s (resident) | 4,087 s (resident) |
 | `satellite` | 12.2 s (resident) | 94.0 s (resident) | 912 s (resident) | 9,088 s (resident) |
 
+### 1,000,000 documents (m=64 bytes/code, R=32, alpha=1.100000023841858)
+
+Record 194 bytes, 19.0 per 4 KiB page, database 2,333.6 MB, code blob 64.00 MB.
+
+| ordering | codes | L | beam | rerank | recall@10 | pages | runs | hops | `ideal` | `wifi` | `5g` | `lte` | `3g` | `satellite` |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Bfs | ondisk | 32 | 4 | 0 | 0.213 | 994 | 756 | 17 | 0 ms | 2.7 s | 5.1 s | 11.7 s | 47.6 s | 83.2 s |
+| Bfs | ondisk | 32 | 4 | 100 | 0.272 | 1,026 | 787 | 18 | 0 ms | 2.8 s | 5.4 s | 12.3 s | 49.8 s | 88.1 s |
+| Bfs | ondisk | 32 | 16 | 0 | 0.215 | 1,363 | 924 | 11 | 0 ms | 3.2 s | 5.8 s | 13.8 s | 58.7 s | 94.6 s |
+| Bfs | ondisk | 32 | 16 | 100 | 0.271 | 1,394 | 955 | 12 | 0 ms | 3.4 s | 6.3 s | 14.8 s | 62.2 s | 103 s |
+| Bfs | ondisk | 128 | 4 | 0 | 0.275 | 2,350 | 1,624 | 41 | 0 ms | 5.8 s | 10.8 s | 25.2 s | 106 s | 176 s |
+| Bfs | ondisk | 128 | 4 | 100 | 0.359 | 2,448 | 1,722 | 42 | 0 ms | 6.0 s | 11.1 s | 25.9 s | 109 s | 180 s |
+| Bfs | ondisk | 128 | 16 | 0 | 0.281 | 2,697 | 1,749 | 17 | 0 ms | 6.4 s | 11.6 s | 27.3 s | 116 s | 188 s |
+| Bfs | ondisk | 128 | 16 | 100 | 0.366 | 2,795 | 1,847 | 18 | 0 ms | 6.7 s | 12.3 s | 28.8 s | 122 s | 199 s |
+| Bfs | resident | 32 | 4 | 0 | 0.213 | 51 | 47 | 17 | 0 ms | 288 ms | 612 ms | 1.3 s | 4.4 s | 10.3 s |
+| Bfs | resident | 32 | 4 | 100 | 0.272 | 82 | 79 | 18 | 0 ms | 324 ms | 657 ms | 1.4 s | 5.3 s | 10.9 s |
+| Bfs | resident | 32 | 16 | 0 | 0.215 | 79 | 70 | 11 | 0 ms | 382 ms | 796 ms | 1.7 s | 6.0 s | 13.3 s |
+| Bfs | resident | 32 | 16 | 100 | 0.271 | 110 | 101 | 12 | 0 ms | 432 ms | 876 ms | 1.9 s | 7.1 s | 14.6 s |
+| Bfs | resident | 128 | 4 | 0 | 0.275 | 137 | 129 | 41 | 0 ms | 705 ms | 1.5 s | 3.2 s | 11.0 s | 24.8 s |
+| Bfs | resident | 128 | 4 | 100 | 0.359 | 235 | 227 | 42 | 0 ms | 784 ms | 1.5 s | 3.5 s | 13.2 s | 25.6 s |
+| Bfs | resident | 128 | 16 | 0 | 0.281 | 172 | 157 | 17 | 0 ms | 622 ms | 1.2 s | 2.8 s | 10.3 s | 20.7 s |
+| Bfs | resident | 128 | 16 | 100 | 0.366 | 270 | 255 | 18 | 0 ms | 987 ms | 2.0 s | 4.4 s | 16.3 s | 32.8 s |
+| Cluster | ondisk | 32 | 4 | 0 | 0.213 | 1,384 | 1,184 | 17 | 0 ms | 4.0 s | 7.6 s | 17.3 s | 69.1 s | 125 s |
+| Cluster | ondisk | 32 | 4 | 100 | 0.272 | 1,416 | 1,216 | 18 | 0 ms | 4.2 s | 8.0 s | 18.2 s | 72.2 s | 132 s |
+| Cluster | ondisk | 32 | 16 | 0 | 0.215 | 2,376 | 1,920 | 11 | 0 ms | 6.5 s | 12.3 s | 28.3 s | 115 s | 202 s |
+| Cluster | ondisk | 32 | 16 | 100 | 0.271 | 2,407 | 1,951 | 12 | 0 ms | 6.6 s | 12.5 s | 28.8 s | 117 s | 206 s |
+| Cluster | ondisk | 128 | 4 | 0 | 0.275 | 3,074 | 2,363 | 41 | 0 ms | 8.2 s | 15.4 s | 35.4 s | 145 s | 251 s |
+| Cluster | ondisk | 128 | 4 | 100 | 0.359 | 3,174 | 2,462 | 42 | 0 ms | 8.4 s | 15.7 s | 36.3 s | 149 s | 257 s |
+| Cluster | ondisk | 128 | 16 | 0 | 0.281 | 4,036 | 2,973 | 17 | 0 ms | 10.3 s | 19.2 s | 44.5 s | 185 s | 313 s |
+| Cluster | ondisk | 128 | 16 | 100 | 0.366 | 4,135 | 3,072 | 18 | 0 ms | 10.5 s | 19.6 s | 45.6 s | 189 s | 320 s |
+| Cluster | resident | 32 | 4 | 0 | 0.213 | 57 | 54 | 17 | 0 ms | 292 ms | 614 ms | 1.3 s | 4.6 s | 10.3 s |
+| Cluster | resident | 32 | 4 | 100 | 0.272 | 89 | 86 | 18 | 0 ms | 328 ms | 659 ms | 1.5 s | 5.4 s | 10.9 s |
+| Cluster | resident | 32 | 16 | 0 | 0.215 | 104 | 98 | 11 | 0 ms | 398 ms | 804 ms | 1.8 s | 6.5 s | 13.4 s |
+| Cluster | resident | 32 | 16 | 100 | 0.271 | 135 | 130 | 12 | 0 ms | 449 ms | 884 ms | 2.0 s | 7.6 s | 14.6 s |
+| Cluster | resident | 128 | 4 | 0 | 0.275 | 144 | 132 | 41 | 0 ms | 709 ms | 1.5 s | 3.2 s | 11.1 s | 24.8 s |
+| Cluster | resident | 128 | 4 | 100 | 0.359 | 243 | 231 | 42 | 0 ms | 789 ms | 1.5 s | 3.5 s | 13.4 s | 25.6 s |
+| Cluster | resident | 128 | 16 | 0 | 0.281 | 197 | 182 | 17 | 0 ms | 639 ms | 1.3 s | 2.8 s | 10.8 s | 20.7 s |
+| Cluster | resident | 128 | 16 | 100 | 0.366 | 296 | 281 | 18 | 0 ms | 1.0 s | 2.0 s | 4.4 s | 16.9 s | 32.9 s |
+| Identity | ondisk | 32 | 4 | 0 | 0.213 | 1,519 | 1,470 | 17 | 0 ms | 4.8 s | 9.4 s | 21.2 s | 82.1 s | 155 s |
+| Identity | ondisk | 32 | 4 | 100 | 0.272 | 1,551 | 1,502 | 18 | 0 ms | 4.8 s | 9.3 s | 21.0 s | 82.2 s | 154 s |
+| Identity | ondisk | 32 | 16 | 0 | 0.215 | 2,652 | 2,505 | 11 | 0 ms | 8.0 s | 15.5 s | 35.1 s | 138 s | 255 s |
+| Identity | ondisk | 32 | 16 | 100 | 0.271 | 2,684 | 2,537 | 12 | 0 ms | 8.2 s | 16.0 s | 36.1 s | 141 s | 264 s |
+| Identity | ondisk | 128 | 4 | 0 | 0.275 | 3,548 | 3,279 | 41 | 0 ms | 10.9 s | 21.3 s | 47.9 s | 187 s | 350 s |
+| Identity | ondisk | 128 | 4 | 100 | 0.359 | 3,648 | 3,379 | 42 | 0 ms | 11.2 s | 21.8 s | 49.1 s | 192 s | 359 s |
+| Identity | ondisk | 128 | 16 | 0 | 0.281 | 4,692 | 4,224 | 17 | 0 ms | 13.8 s | 26.5 s | 60.2 s | 239 s | 436 s |
+| Identity | ondisk | 128 | 16 | 100 | 0.366 | 4,792 | 4,324 | 18 | 0 ms | 14.2 s | 27.4 s | 62.1 s | 246 s | 451 s |
+| Identity | resident | 32 | 4 | 0 | 0.213 | 59 | 59 | 17 | 0 ms | 294 ms | 614 ms | 1.3 s | 4.6 s | 10.3 s |
+| Identity | resident | 32 | 4 | 100 | 0.272 | 91 | 91 | 18 | 0 ms | 330 ms | 660 ms | 1.5 s | 5.5 s | 10.9 s |
+| Identity | resident | 32 | 16 | 0 | 0.215 | 108 | 108 | 11 | 0 ms | 401 ms | 805 ms | 1.8 s | 6.6 s | 13.4 s |
+| Identity | resident | 32 | 16 | 100 | 0.271 | 140 | 140 | 12 | 0 ms | 452 ms | 886 ms | 2.0 s | 7.7 s | 14.6 s |
+| Identity | resident | 128 | 4 | 0 | 0.275 | 156 | 156 | 41 | 0 ms | 718 ms | 1.5 s | 3.2 s | 11.4 s | 24.9 s |
+| Identity | resident | 128 | 4 | 100 | 0.359 | 256 | 256 | 42 | 0 ms | 1.4 s | 3.0 s | 6.4 s | 22.1 s | 50.8 s |
+| Identity | resident | 128 | 16 | 0 | 0.281 | 212 | 211 | 17 | 0 ms | 904 ms | 1.9 s | 4.0 s | 14.5 s | 30.9 s |
+| Identity | resident | 128 | 16 | 100 | 0.366 | 312 | 311 | 18 | 0 ms | 1.0 s | 2.0 s | 4.5 s | 17.2 s | 32.9 s |
+
+#### Resident codes: session cost including the one-time preload
+
+Preload is 64.00 MB. Chosen configuration: L=32, beam=4, rerank=0.
+
+Cheaper option in brackets. Per-query tables above exclude the preload;
+this one includes it, which is the comparison that decides the design.
+
+| profile | 1 query | 10 queries | 100 queries | 1000 queries |
+|---|---:|---:|---:|---:|
+| `ideal` | 0 ms (tie) | 0 ms (tie) | 0 ms (tie) | 0 ms (tie) |
+| `wifi` | 4.8 s (on-disk) | 13.2 s (resident) | 39.6 s (resident) | 304 s (resident) |
+| `5g` | 5.8 s (resident) | 11.3 s (resident) | 66.6 s (resident) | 620 s (resident) |
+| `lte` | 21.2 s (on-disk) | 47.4 s (resident) | 166 s (resident) | 1,353 s (resident) |
+| `3g` | 82.1 s (on-disk) | 366 s (resident) | 781 s (resident) | 4,932 s (resident) |
+| `satellite` | 36.5 s (resident) | 129 s (resident) | 1,056 s (resident) | 10,323 s (resident) |
+
 ## Retrieval quality on the code-search corpus
 
 3,366 functions, 500 docstring queries. Ground truth is the corpus construction, so no judgments are involved.
 
 | system | success@1 | success@10 | success@100 | MRR@10 | bytes/doc | ms/query |
 |---|---:|---:|---:|---:|---:|---:|
-| BM25 (FTS5) | 0.280 | 0.542 | 0.762 | 0.362 | — | 2.53 |
-| Dense (MiniLM) | 0.350 | 0.698 | 0.932 | 0.463 | 1,536 | 0.30 |
-| Late interaction (LateOn) | 0.456 | 0.782 | 0.948 | 0.568 | 27,797 | 277.01 |
+| BM25 (FTS5) | 0.280 | 0.542 | 0.762 | 0.362 | — | 2.57 |
+| Dense (MiniLM) | 0.350 | 0.698 | 0.932 | 0.463 | 1,536 | 0.31 |
+| Late interaction (LateOn) | 0.454 | 0.780 | 0.950 | 0.567 | 28,240 | 120.03 |
 
