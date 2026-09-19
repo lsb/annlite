@@ -156,13 +156,19 @@ def main() -> int:
         "results": results,
     }, indent=2) + "\n")
     print(f"\n-> {out}")
-    # Keep the multi-vector embeddings for the PLAID index measurement.
-    np.save(REPO / "data/embeddings/code-late-lengths.npy",
-            np.array([d.shape[0] for d in DV], dtype=np.int32))
-    np.vstack(DV).astype(np.float32).tofile(REPO / "data/embeddings/code-late.f32")
-    np.save(REPO / "data/embeddings/code-late-qlengths.npy",
-            np.array([q.shape[0] for q in QV], dtype=np.int32))
-    np.vstack(QV).astype(np.float32).tofile(REPO / "data/embeddings/code-late-q.f32")
+    # Hand the multi-vector embeddings to the PLAID measurement.
+    #
+    # Lengths are written as raw int32 in the same pass as the vectors they describe,
+    # not as .npy converted later. An earlier version left that conversion as a
+    # manual step, and re-running this script updated the vectors while the lengths
+    # stayed behind -- so the Rust side would have been slicing 495,075 vectors with
+    # a table describing 487,313. Writing both here makes the pair inseparable.
+    emb = REPO / "data/embeddings"
+    np.array([d.shape[0] for d in DV], dtype=np.int32).tofile(emb / "code-late-lengths.i32")
+    np.vstack(DV).astype(np.float32).tofile(emb / "code-late.f32")
+    np.array([q.shape[0] for q in QV], dtype=np.int32).tofile(emb / "code-late-qlengths.i32")
+    np.vstack(QV).astype(np.float32).tofile(emb / "code-late-q.f32")
+    print(f"multi-vector embeddings: {tokens:,} document tokens -> {emb}/code-late.f32")
     return 0
 
 
