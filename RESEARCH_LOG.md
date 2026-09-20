@@ -1439,7 +1439,70 @@ reranking reads uncompressed vectors — is what puts it there.
 
 ---
 
-## 18. Open items
+## 18. Residual quantization, and the compute axis finally measured
+
+### 18.1 Closing the gap section 15.2 left open
+
+Section 15.2 found that PLAID compresses the *candidate-generation* data but not the
+data exact reranking reads, so the system was cheap and weak (646 bytes per document,
+success@1 0.240) or accurate and enormous (28,239 bytes, 0.454) with nothing between.
+ColBERTv2's answer is to keep a few bits of the residual `v - centroid[c]` per
+dimension, so reranking reconstructs `centroid + residual` and never touches a full
+vector. Implemented in `annlite_core::residual` and measured on the same corpus:
+
+| residual bits | bytes/token | bytes/doc | vs uncompressed | success@1 | success@10 | MRR@10 |
+|---:|---:|---:|---:|---:|---:|---:|
+| none (centroid only) | 4 | 646 | 48x | 0.240 | 0.578 | 0.343 |
+| 1 | 10 | 1,529 | 19.2x | 0.322 | 0.650 | 0.425 |
+| **2** | **16** | **2,411** | **12.0x** | **0.388** | **0.718** | **0.493** |
+| 4 | 28 | 4,176 | 6.9x | 0.400 | 0.742 | 0.520 |
+| exact float32 | 192 | 28,239 | 1x | 0.454 | 0.780 | 0.567 |
+
+**Two bits per dimension recovers 85% of exact quality for 8.5% of the storage.**
+That is the configuration the gap was asking for, and it moves late interaction from
+28 GB at a million documents to about 2.4 GB.
+
+It does not close the gap entirely, and the shape of the shortfall is worth noting:
+going from 2 bits to 4 doubles the residual budget and buys 0.012 of success@1, while
+neither reaches the exact 0.454. The candidate pool is not the constraint — the exact
+baseline reranks the same 100 — so the residue is genuine reconstruction error that
+more bits stop paying for. Somewhere past two bits the quantizer is no longer what
+limits the ranking.
+
+Bucket cutoffs are quantiles of the residual distribution pooled across all
+dimensions rather than fitted per dimension, following ColBERTv2. Residuals are
+differences from a nearby centroid, so their spread is set by how far tokens sit from
+their cluster centre rather than by which axis is measured, and a per-dimension
+codebook would spend `dim` times the table on nearly the same distribution. Buckets
+are equal-mass rather than equal-width because the distribution is sharply peaked at
+zero; equal-width buckets would spend most of their code space on empty tails.
+
+### 18.2 The compute axis, and a methodology result
+
+Every CPU figure so far carried `contended: true`, because three benchmarks shared
+the machine and wall-clock timings moved by more than a factor of two. Re-running all
+three systems sequentially on an idle box:
+
+| system | contended | clean | change |
+|---|---:|---:|---:|
+| FTS5, post-vacuum | 2.09 ms | 1.90 ms | 0.91x |
+| dense, m=64, no rerank | 1.06 ms | 1.04 ms | 0.98x |
+| dense, m=32, rerank 100 | 1.61 ms | 1.53 ms | 0.95x |
+
+**The figures move by 2 to 9%.** So the contention caveat, which has qualified every
+compute number in this log, was over-cautious: what mattered was the decision to
+measure *process CPU time* rather than wall clock, not the state of the machine. Wall
+clock moved by more than 2x under the same load; CPU time moved by under a tenth.
+The compute axis can be read at face value.
+
+The flag is now measured rather than asserted. `LoadWitness` samples
+`/proc/loadavg`'s runnable count through each measurement and reports what it saw;
+hardcoding `contended: true` was honest while it was true and would have gone
+silently stale the moment the box went quiet, which is exactly what happened.
+
+---
+
+## 19. Open items
 
 * **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
 * **Needed:** an emscripten toolchain for the WASM milestone.

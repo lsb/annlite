@@ -89,7 +89,7 @@ fn mean(xs: &[f64]) -> f64 {
 ///
 /// Wall clock on this machine moves by more than 2x with background load, which is
 /// why every timing here is CPU time and why the emitted records still carry
-/// `contended: true` — CPU time is steadier, not immune.
+/// a measured `contended` flag — CPU time is steadier than wall clock, not immune.
 fn cpu_seconds() -> f64 {
     let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
     // Field 2 is the command name, parenthesised and free to contain spaces, so the
@@ -176,8 +176,14 @@ fn main() -> Result<()> {
                 let (mut pages, mut runs, mut hops) = (Vec::new(), Vec::new(), Vec::new());
                 let mut stage = [[0f64; 2]; 3]; // [stage][pages, payload bytes]
                 let mut cands = 0f64;
+                // Sampled through the loop so the contention flag is an observation
+                // rather than an assertion; see `annlite_fts5::cpu::LoadWitness`.
+                let mut witness = annlite_fts5::cpu::LoadWitness::new();
                 let cpu0 = cpu_seconds();
                 for qi in 0..n_q {
+                    if qi % 25 == 0 {
+                        witness.sample();
+                    }
                     let res = late_search(&conn, &db, &queries[qi], probe, docs.len(), rerank)?;
                     let pos = res.results.iter().position(|x| x.0 as usize == gold[qi]);
                     ranks.push(pos.map(|p| p + 1).unwrap_or(ABSENT));
@@ -191,6 +197,7 @@ fn main() -> Result<()> {
                         stage[i][1] += s.bytes as f64;
                     }
                 }
+                witness.sample();
                 let cpu_ms = (cpu_seconds() - cpu0) * 1000.0 / n_q as f64;
                 let q = metrics(&ranks);
                 let mut sp = pages.clone();
@@ -264,7 +271,9 @@ fn main() -> Result<()> {
                         },
                         "hops": mean(&hops),
                         "cpu_ms_per_query": cpu_ms,
-                        "contended": true,
+                        "contended": witness.contended(),
+                        "peak_runnable": witness.peak_runnable,
+                        "load_1min": witness.load_1min,
                         "notes": note,
                     })
                 )?;

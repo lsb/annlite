@@ -112,7 +112,9 @@ and so cannot be answered; the attainable ceiling is 0.962, not 1.0.**
 | Dense (MiniLM) | 0.350 | 0.463 | 1,536 |
 | **Late interaction (LateOn)** | **0.454** | **0.567** | 28,240 |
 | PLAID staging, 1,024 centroids, no rerank | 0.240 | 0.343 | **928** |
-| PLAID staging + exact rerank of 100 | **0.454** | **0.563** | 29,196 |
+| + 2-bit residuals, rerank compressed | 0.388 | 0.493 | 2,411 |
+| + 4-bit residuals, rerank compressed | 0.400 | 0.520 | 4,176 |
+| + exact rerank against float32 | **0.454** | **0.563** | 29,196 |
 
 As a fraction of the 0.962 attainable: BM25 0.291, dense 0.364, late interaction
 **0.472**.

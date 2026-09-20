@@ -42,3 +42,54 @@ pub fn since_ms(start: Option<u64>) -> Option<f64> {
     let (a, b) = (start?, process_cpu_nanos()?);
     Some(b.saturating_sub(a) as f64 / 1e6)
 }
+
+/// Competing load observed while a measurement ran.
+///
+/// Whether a timing was taken under contention is a fact about the machine, not
+/// something a benchmark should assert. Earlier runs hardcoded `contended: true`,
+/// which was honest at the time and became wrong the moment the box went quiet —
+/// and nothing in the output would have said so. This samples instead.
+///
+/// The signal is the runnable-task count from `/proc/loadavg`'s fourth field
+/// (`running/total`). A single-threaded benchmark with the machine to itself sits at
+/// 1; anything above the sampler's own footprint is somebody else's work. The
+/// one-minute load average is recorded alongside it because the runnable count is
+/// instantaneous and can miss a neighbour that is briefly blocked on I/O.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadWitness {
+    pub peak_runnable: u32,
+    pub load_1min: f64,
+    samples: u32,
+}
+
+impl LoadWitness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take one observation. Call periodically through a measurement.
+    pub fn sample(&mut self) {
+        let Ok(raw) = std::fs::read_to_string("/proc/loadavg") else { return };
+        let mut fields = raw.split_whitespace();
+        if let Some(load) = fields.next().and_then(|f| f.parse::<f64>().ok()) {
+            self.load_1min = self.load_1min.max(load);
+        }
+        // Fourth field is "running/total".
+        if let Some(runnable) = fields
+            .nth(2)
+            .and_then(|f| f.split('/').next().and_then(|r| r.parse::<u32>().ok()))
+        {
+            self.peak_runnable = self.peak_runnable.max(runnable);
+        }
+        self.samples += 1;
+    }
+
+    /// Whether anything beyond this process was competing for CPU.
+    ///
+    /// Two runnable tasks is the measuring process plus the sampler's own read, so
+    /// the threshold sits above that. Returns `None` when nothing was sampled, so a
+    /// caller reports an unknown rather than a confident "clean".
+    pub fn contended(&self) -> Option<bool> {
+        (self.samples > 0).then(|| self.peak_runnable > 2 || self.load_1min > 1.5)
+    }
+}

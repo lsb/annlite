@@ -31,7 +31,22 @@ QUERIES = 500
 #: Every timing in this file was taken on a machine running other benchmark work, so
 #: it is an upper bound rather than a measurement. Page counts, byte counts and
 #: quality figures are unaffected by that and are the numbers to trust.
-CONTENDED = True
+def _observed_contention() -> bool:
+    """Whether anything else was competing for CPU, read rather than assumed.
+
+    Earlier runs hardcoded this True, which was correct while three benchmarks shared
+    the machine and became silently wrong once it went quiet. `/proc/loadavg`'s fourth
+    field is `running/total`; a lone benchmark plus this reader is two.
+    """
+    try:
+        with open("/proc/loadavg") as f:
+            fields = f.read().split()
+        return int(fields[3].split("/")[0]) > 2 or float(fields[0]) > 1.5
+    except (OSError, ValueError, IndexError):
+        return True
+
+
+CONTENDED = _observed_contention()
 
 
 def records(path: Path) -> list[dict]:
