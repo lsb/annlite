@@ -1,0 +1,12 @@
+# Python dependencies for the measurement pipeline, pinned.
+#
+# A benchmark whose encoder library can change underneath it is not reproducible:
+# onnxruntime's operator implementations decide the embeddings, and the embeddings
+# decide every quality number in RESEARCH_LOG.md. These are the versions §1 records
+# and every committed result under bench/results/ was produced with.
+#
+#   make venv    # creates .venv and installs this file
+numpy==2.4.6
+onnxruntime==1.30.0
+tokenizers==0.23.2
+pytest==8.4.2

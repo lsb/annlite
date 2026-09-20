@@ -11,3 +11,6 @@ anyhow.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 rayon = "1"
+
+[dev-dependencies]
+serde_json.workspace = true

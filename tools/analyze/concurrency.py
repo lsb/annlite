@@ -79,10 +79,14 @@ def rows_for_comparison() -> list[tuple[str, Access]]:
     tri = load("tri-*.jsonl")
 
     def pick(system: str, config: str) -> dict:
-        for r in tri:
-            if r["system"] == system and r["config"] == config:
-                return r
-        raise KeyError(f"no measurement for {system} {config!r}")
+        # Last match, not first. These files are written by whole-run truncation now,
+        # but a file that did accumulate duplicates should publish its most recent
+        # measurement rather than its oldest -- the reverse silently kept a stale
+        # contended timing in the tables after section 18.2 re-measured it.
+        matches = [r for r in tri if r["system"] == system and r["config"] == config]
+        if not matches:
+            raise KeyError(f"no measurement for {system} {config!r}")
+        return matches[-1]
 
     out: list[tuple[str, Access]] = []
 

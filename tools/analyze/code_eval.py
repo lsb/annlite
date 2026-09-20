@@ -164,6 +164,7 @@ def main() -> int:
     # stayed behind -- so the Rust side would have been slicing 495,075 vectors with
     # a table describing 487,313. Writing both here makes the pair inseparable.
     emb = REPO / "data/embeddings"
+    emb.mkdir(parents=True, exist_ok=True)
     np.array([d.shape[0] for d in DV], dtype=np.int32).tofile(emb / "code-late-lengths.i32")
     np.vstack(DV).astype(np.float32).tofile(emb / "code-late.f32")
     np.array([q.shape[0] for q in QV], dtype=np.int32).tofile(emb / "code-late-qlengths.i32")

@@ -13,14 +13,21 @@ use std::path::Path;
 fn main() -> anyhow::Result<()> {
     let n: usize = std::env::args().nth(1).unwrap_or_else(|| "2000".into()).parse()?;
     let out = std::env::args().nth(2).unwrap_or_else(|| "web/demo/annlite-demo.db".into());
+    // Embeddings and text default to the 10k word corpus, which is what the 2,000
+    // document demo is cut from. A larger demo -- the one that asks whether a client
+    // can still just download the file (RESEARCH_LOG 13.4) -- passes its own pair.
+    // The corpora are byte-exact prefixes of each other, so document `i` is the same
+    // document at every scale and a bigger source is a superset, not a different set.
+    let emb = std::env::args().nth(3).unwrap_or_else(|| "data/embeddings/docs-10k.f32".into());
+    let corpus = std::env::args().nth(4).unwrap_or_else(|| "data/corpus/docs-10k.txt".into());
     let dim = 384usize;
     let (m, r) = (32usize, 24usize);
 
-    let all = Vectors::load(Path::new("data/embeddings/docs-10k.f32"), dim)?;
-    anyhow::ensure!(all.len() >= n, "only {} embeddings available", all.len());
+    let all = Vectors::load(Path::new(&emb), dim)?;
+    anyhow::ensure!(all.len() >= n, "only {} embeddings in {emb}, need {n}", all.len());
     let docs = Vectors { data: all.data[..n * dim].to_vec(), dim };
 
-    let text: Vec<String> = std::io::BufReader::new(std::fs::File::open("data/corpus/docs-10k.txt")?)
+    let text: Vec<String> = std::io::BufReader::new(std::fs::File::open(&corpus)?)
         .lines()
         .take(n)
         .collect::<Result<_, _>>()?;

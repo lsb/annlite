@@ -103,16 +103,80 @@ fn cpu_seconds() -> f64 {
     (get(11) + get(12)) / 100.0
 }
 
+/// Which corpus this run measures, and where its pieces live.
+///
+/// The code corpus is the one late interaction was built for and the only one with
+/// a published success@1 ceiling, but the cost axis this project is about -- pages,
+/// requests, hops -- is meaningful on the word corpora too, and the FTS5 and dense
+/// baselines are already measured there. Naming the target rather than hardcoding it
+/// is what lets all three systems be compared at the same scale.
+struct Target {
+    label: String,
+    emb_prefix: String,
+    gold_path: std::path::PathBuf,
+    out_path: std::path::PathBuf,
+    /// Highest success@1 the query set admits, where one has been established.
+    ceiling: Option<f64>,
+}
+
+impl Target {
+    fn new(label: &str) -> Result<Self> {
+        Ok(match label {
+            // 7.4% of code queries share a docstring with another function and cannot
+            // be answered as known-item retrieval (RESEARCH_LOG 15.1).
+            "code" => Target {
+                label: label.into(),
+                emb_prefix: "code-late".into(),
+                gold_path: "data/corpus/code-queries.jsonl".into(),
+                out_path: "bench/results/tri-late.jsonl".into(),
+                ceiling: Some(0.962),
+            },
+            // Word corpora: `words-10k` reads the embeddings written for docs-10k.txt
+            // and the first 500 queries of queries-10k.jsonl, which are all
+            // known-item with a gold document, exactly as the dense sweep uses them.
+            scale if scale.starts_with("words-") => {
+                let s = &scale["words-".len()..];
+                Target {
+                    label: label.into(),
+                    emb_prefix: format!("{label}-late"),
+                    gold_path: format!("data/corpus/queries-{s}.jsonl").into(),
+                    out_path: format!("bench/results/late-{label}.jsonl").into(),
+                    ceiling: None,
+                }
+            }
+            other => anyhow::bail!(
+                "unknown corpus {other:?}; expected \"code\" or \"words-<scale>\""
+            ),
+        })
+    }
+}
+
 fn main() -> Result<()> {
     let dim = 48;
-    let n_q: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(500);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flag = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+    // A bare positional number stays supported: `late_pages -- 500` is how the
+    // committed code-corpus rows were produced.
+    let n_q: usize = flag("--queries")
+        .or_else(|| args.first().filter(|a| a.parse::<usize>().is_ok()).cloned())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    let target = Target::new(&flag("--corpus").unwrap_or_else(|| "code".into()))?;
+    let ks: Vec<usize> = match flag("--k") {
+        Some(v) => v.split(',').map(|x| x.trim().parse::<usize>()).collect::<Result<_, _>>()?,
+        None => vec![512, 1024, 2048],
+    };
+
     let emb = Path::new("data/embeddings");
-    let dl = read_lengths(&emb.join("code-late-lengths.i32"))?;
-    let ql = read_lengths(&emb.join("code-late-qlengths.i32"))?;
-    let docs = read_multi(&emb.join("code-late.f32"), &dl, dim)?;
-    let queries = read_multi(&emb.join("code-late-q.f32"), &ql, dim)?;
+    let pfx = &target.emb_prefix;
+    let dl = read_lengths(&emb.join(format!("{pfx}-lengths.i32")))?;
+    let ql = read_lengths(&emb.join(format!("{pfx}-qlengths.i32")))?;
+    let docs = read_multi(&emb.join(format!("{pfx}.f32")), &dl, dim)?;
+    let queries = read_multi(&emb.join(format!("{pfx}-q.f32")), &ql, dim)?;
     let n_q = n_q.min(queries.len());
-    let gold = gold(Path::new("data/corpus/code-queries.jsonl"), n_q)?;
+    let gold = gold(&target.gold_path, n_q)?;
     let total_tokens: usize = dl.iter().sum();
 
     let mut lens: Vec<f64> = dl.iter().map(|&x| x as f64).collect();
@@ -127,8 +191,17 @@ fn main() -> Result<()> {
 
     std::fs::create_dir_all("data/db")?;
     std::fs::create_dir_all("bench/results")?;
-    let out_path = Path::new("bench/results/tri-late.jsonl");
-    let mut out = std::fs::OpenOptions::new().create(true).append(true).open(out_path)?;
+    // Truncated, not appended. The readers in tools/analyze pick the *first* row
+    // matching a (system, config), so an appended re-run does not replace the old
+    // measurement -- it hides behind it. That is exactly what happened to the
+    // section 18.2 re-measurement: every late row was written twice and the stale
+    // contended one kept being published. One run now produces one complete file.
+    let out_path = target.out_path.clone();
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&out_path)?;
 
     println!(
         "\n{:>6} {:>6} {:>7} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>8} {:>6} {:>8}",
@@ -137,7 +210,7 @@ fn main() -> Result<()> {
     );
     println!("{}", "-".repeat(110));
 
-    for &k in &[512usize, 1024, 2048] {
+    for &k in &ks {
         let t0 = std::time::Instant::now();
         let cpu0 = cpu_seconds();
         // Centroids are fitted on a strided sample; every token is still assigned.
@@ -147,7 +220,7 @@ fn main() -> Result<()> {
         let build_cpu = cpu_seconds() - cpu0;
         let build_wall = t0.elapsed().as_secs_f64();
 
-        let db_path = format!("data/db/late-code-k{k}.db");
+        let db_path = format!("data/db/late-{}-k{k}.db", target.label);
         let _ = std::fs::remove_file(&db_path);
         let mut conn = Connection::open(&db_path)?;
         let meta = write_late_index(&mut conn, &idx, &docs)?;
@@ -168,7 +241,7 @@ fn main() -> Result<()> {
         for &probe in &[4usize, 8, 32] {
             // Probe width is swept only at the centroid count section 15.2 settled
             // on; at the others it is held at 8 so the k comparison is clean.
-            if k != 1024 && probe != 8 {
+            if ks.len() > 1 && k != 1024 && probe != 8 {
                 continue;
             }
             for &rerank in &[0usize, 100] {
@@ -231,11 +304,10 @@ fn main() -> Result<()> {
                      late_codes{}, from dbstat; whole file is {file_bytes} bytes. \
                      Candidate pool {:.0} of {} documents ({:.1}%), so the inverted list prunes \
                      almost nothing at this scale (RESEARCH_LOG 15.3): stage 2 touches {:.0} of \
-                     the code arena's {} pages, i.e. it is a full scan and the arena would be \
+                     the centroid-code arena's {} pages, i.e. it is a full scan and the arena would be \
                      better made resident. Arena overflow chains are \
                      consecutive, so each stage's runs are near 1 per contiguous span. \
-                     cpu_ms_per_query is /proc/self/stat utime+stime, not wall clock. \
-                     success@1 ceiling on this query set is 0.962.",
+                     cpu_ms_per_query is /proc/self/stat utime+stime, not wall clock.{}",
                     meta.write_seconds,
                     db.resident_bytes(),
                     db.centroids.len() * 4,
@@ -248,12 +320,19 @@ fn main() -> Result<()> {
                     cands / f / docs.len() as f64 * 100.0,
                     stage[1][0] / f,
                     db.codes_arena.pages(),
+                    match target.ceiling {
+                        Some(c) => format!(" success@1 ceiling on this query set is {c}."),
+                        // The word corpora have no published ceiling: their gold is one
+                        // specific source document by construction, and nothing here
+                        // establishes how often another document is equally correct.
+                        None => String::new(),
+                    },
                 );
                 writeln!(
                     out,
                     "{}",
                     serde_json::json!({
-                        "record": "system", "corpus": "code", "docs": docs.len(), "queries": n_q,
+                        "record": "system", "corpus": target.label, "docs": docs.len(), "queries": n_q,
                         "system": "late",
                         "config": format!("k={k}/probe={probe}/rerank={rerank}"),
                         "build_seconds": build_wall,

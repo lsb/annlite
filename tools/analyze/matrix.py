@@ -231,24 +231,146 @@ def main() -> int:
               f"{m['success@100']:.3f} | {m['mrr@10']:.3f} | {bpd} | {m['ms_per_query']:.2f} |")
         w("")
 
+    # --- the bounded-range SQLite client -----------------------------------
+    # What a client that does not speculate actually fetches. The interesting column
+    # is the last one: it is what says whether "just download the file" is still an
+    # option at this size.
+    rng = load_jsonl(RESULTS / "range-vfs.jsonl")
+    if rng:
+        w("## SQLite over bounded HTTP ranges\n")
+        w("SQLite 3.46.0 compiled to WASM with a VFS that issues one Range request per")
+        w("`xRead`, for exactly the bytes asked for. Counted independently by the VFS")
+        w("and by the simulator's request log; a run is discarded unless they agree.")
+        w("Produced by `make range-demo`.\n")
+        by_db: dict[str, list[dict]] = {}
+        for r in rng:
+            by_db.setdefault(r["database"], []).append(r)
+        for db, rows in sorted(by_db.items(), key=lambda kv: kv[1][0]["database_bytes"]):
+            size = rows[0]["database_bytes"]
+            w(f"**`{db}`** — {size:,} bytes, {size // PAGE_BYTES:,} pages.\n")
+            w("| operation | pages | requests | bytes | of file |")
+            w("|---|---:|---:|---:|---:|")
+            for r in rows:
+                w(f"| {r['query']} | {r['pages']:,} | {r['requests']:,} | "
+                  f"{r['bytes']:,} | {r['fraction_of_file']:.2%} |")
+            w("")
+
+    # --- three systems on the word corpus ----------------------------------
+    # The code corpus is where late interaction was built to win. This is the other
+    # case: 10,000 documents of fifty random dictionary words, which is the scale at
+    # which all three systems have been measured against the same 500 known-item
+    # queries and the same gold document. Quality here is success@1 against that
+    # gold, not recall against the index's own exact search -- the two answer
+    # different questions and only the first is comparable across systems.
+    fts_w = load_jsonl(RESULTS / "fts5-10k.jsonl")
+    ann_w = load_jsonl(RESULTS / "ann-10k-gold.jsonl")
+    late_w = load_jsonl(RESULTS / "late-words-10k.jsonl")
+    if fts_w and ann_w and late_w:
+        w("## Three systems on the word corpus\n")
+        w("10,000 documents of fifty random dictionary words, 500 known-item queries,")
+        w("one gold document each. `success@1` is against that gold for all three, so")
+        w("the column means the same thing in every row.\n")
+        w("Produced by `make fts5-10k`, `make ann-gold SCALE=10k` and")
+        w("`make late-words SCALE=10k`.\n")
+        w("| system | configuration | success@1 | MRR@10 | pages | requests | hops |")
+        w("|---|---|---:|---:|---:|---:|---:|")
+
+        # FTS5, post-vacuum, restricted to the known-item queries.
+        q = next((r for r in fts_w if r.get("record") == "quality"), None)
+        pg = next((r for r in fts_w if r.get("record") == "pages"
+                   and r.get("group") == "kind=known_item"
+                   and r.get("phase") == "post_vacuum"), None)
+        if q and pg:
+            ov = q["known_item"]["overall"]
+            s1 = dict(ov["success_at"])[1]
+            m10 = dict(ov["mrr_at"])[10]
+            runs = pg["contiguous_runs"]["mean"]
+            # xRead is synchronous, so FTS5's hop count equals its request count.
+            w(f"| **BM25 (FTS5)** | post-vacuum | **{s1:.3f}** | **{m10:.3f}** | "
+              f"{pg['distinct_pages']['mean']:,.1f} | {runs:,.1f} | {runs:,.0f} |")
+
+        for r in ann_w:
+            if r.get("record") != "query_set" or r.get("mode") != "resident" or r["rerank"]:
+                continue
+            ki = r["known_item"]
+            w(f"| dense (Vamana + PQ) | bfs/resident/L={r['l']}/beam={r.get('beam')}/rerank=0 | "
+              f"{dict(ki['success_at'])[1]:.3f} | {dict(ki['mrr_at'])[10]:.3f} | "
+              f"{r['mean_distinct_pages']:,.1f} | {r['mean_contiguous_runs']:,.1f} | "
+              f"{r['mean_hops']:,.0f} |")
+
+        for cfg in ("k=1024/probe=8/rerank=0", "k=1024/probe=8/rerank=100"):
+            r = next((x for x in late_w if x["config"] == cfg), None)
+            if not r:
+                continue
+            qq = r["quality"]
+            w(f"| late interaction | {cfg} | {qq['success@1']:.3f} | {qq['mrr@10']:.3f} | "
+              f"{r['pages']['mean']:,.1f} | {r['requests']['mean']:,.1f} | {r['hops']:,.0f} |")
+        w("")
+        w("**Lexical matching wins this corpus outright, on both axes.** That is the")
+        w("expected result and it is worth stating plainly: a document of fifty")
+        w("unrelated dictionary words has no topic for an embedding to capture, so")
+        w("section 5.4's finding shows up here as a 0.826 against 0.536 and 0.106.")
+        w("The dense index is not failing as an index -- it recovers 0.757 of its own")
+        w("exact search's top-10 -- it is the representation that has nothing to grip.")
+        w("Late interaction lands in between because MaxSim scores individual tokens,")
+        w("which is closer to what a term match does.\n")
+        w("The cost ranking is the same: FTS5 reaches 26.6 pages where the dense index")
+        w("needs 103.7 and late interaction 1,890. The case for the graph index is at")
+        w("a million documents, where FTS5's per-match lookups stop being cheap")
+        w("(section 16.3); at ten thousand it has no case to make.\n")
+
+    # --- residual quantization --------------------------------------------
+    # Late interaction's storage/quality curve. It belongs beside the three-way
+    # table because it is what moves late interaction from "cheap and weak" to
+    # "accurate and affordable" -- the gap section 15.2 left open.
+    resid = load_jsonl(RESULTS / "residual-code.jsonl")
+    if resid:
+        w("## Residual quantization (late interaction)\n")
+        w("Reranking against centroid+residual reconstructions rather than against")
+        w("stored float32 vectors. `bytes/doc` is everything a client holds, so the")
+        w("rows are directly comparable with the bytes/doc column above.\n")
+        w("| residual bits | bytes/token | bytes/doc | vs exact | success@1 | success@10 | MRR@10 |")
+        w("|---|---:|---:|---:|---:|---:|---:|")
+        order = {"residual/bits=none/rerank=0": 0, "residual/bits=1/rerank=100": 1,
+                 "residual/bits=2/rerank=100": 2, "residual/bits=4/rerank=100": 3,
+                 "exact/full-scan": 4}
+        for r in sorted(resid, key=lambda x: order.get(x["config"], 99)):
+            label = {"residual/bits=none/rerank=0": "none (centroid only)",
+                     "exact/full-scan": "exact float32"}.get(
+                         r["config"], r["config"].split("/")[1].replace("bits=", ""))
+            q = r["quality"]
+            w(f"| {label} | {r['bytes_per_token']:,} | {r['bytes_per_doc']:,} | "
+              f"{r['compression_vs_exact']:.1f}x | {q['success@1']:.3f} | "
+              f"{q['success@10']:.3f} | {q['mrr@10']:.3f} |")
+        w("")
+
     # --- three systems on one corpus ---------------------------------------
     tri = load_jsonl(RESULTS / "tri-code.jsonl") + load_jsonl(RESULTS / "tri-late.jsonl")
     if tri:
         w("## Three systems on one corpus\n")
+        ceiling = 0.962
+        amb = None
+        if code.exists():
+            d = json.loads(code.read_text())
+            ceiling = d.get("success_at_1_ceiling", ceiling)
+            amb = d.get("ambiguous_queries")
+        share = f"{amb / data['queries'] * 100:.1f}% of queries share" if amb else "some queries share"
         w("Code corpus, 3,366 documents, 500 queries. Same single-gold quality")
         w("definition for all three, and the same pass-through VFS counting real file")
-        w("pages. `success@1` has a ceiling of 0.962: 7.4% of queries share a docstring")
+        w(f"pages. `success@1` has a ceiling of {ceiling:.3f}: {share} a docstring")
         w("with another function and cannot be answered as known-item retrieval.\n")
         w("CPU is process time measured under contention — the ordering is meaningful,")
         w("the absolute values are an upper bound.\n")
         w("| system | configuration | success@1 | of max | MRR@10 | pages | requests | bytes/doc | cpu ms |")
         w("|---|---|---:|---:|---:|---:|---:|---:|---:|")
         for sysname, cfg in HEADLINE_CONFIGS:
-            r = next((x for x in tri if x["system"] == sysname and x["config"] == cfg), None)
+            # Last match wins; see the note on `pick` in concurrency.py.
+            dupes = [x for x in tri if x["system"] == sysname and x["config"] == cfg]
+            r = dupes[-1] if dupes else None
             if not r:
                 continue
             q = r["quality"]
-            w(f"| {sysname} | {cfg} | {q['success@1']:.3f} | {q['success@1'] / 0.962:.3f} | "
+            w(f"| {sysname} | {cfg} | {q['success@1']:.3f} | {q['success@1'] / ceiling:.3f} | "
               f"{q['mrr@10']:.3f} | {r['pages']['mean']:,.1f} | {r['requests']['mean']:,.1f} | "
               f"{r['bytes_per_doc']:,.0f} | {r['cpu_ms_per_query']:.2f} |")
         w("")

@@ -1,6 +1,8 @@
 {
   "documents": 3366,
   "queries": 500,
+  "success_at_1_ceiling": 0.9623,
+  "ambiguous_queries": 37,
   "results": {
     "BM25 (FTS5)": {
       "success@1": 0.28,
@@ -8,15 +10,15 @@
       "success@100": 0.762,
       "mrr@10": 0.3618293650793651,
       "build_s": 0.0,
-      "ms_per_query": 2.57
+      "ms_per_query": 2.25
     },
     "Dense (MiniLM)": {
       "success@1": 0.35,
       "success@10": 0.698,
       "success@100": 0.932,
       "mrr@10": 0.4633753968253968,
-      "build_s": 55.6,
-      "ms_per_query": 0.31,
+      "build_s": 45.4,
+      "ms_per_query": 0.21,
       "bytes_per_doc": 1536
     },
     "Late interaction (LateOn)": {
@@ -24,8 +26,8 @@
       "success@10": 0.78,
       "success@100": 0.95,
       "mrr@10": 0.5670031746031745,
-      "build_s": 123.4,
-      "ms_per_query": 120.03,
+      "build_s": 103.5,
+      "ms_per_query": 56.6,
       "bytes_per_doc": 28240,
       "mean_tokens_per_doc": 147.1
     }
