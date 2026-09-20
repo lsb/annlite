@@ -26,7 +26,7 @@ round-trips and bytes fetched alongside wall-clock time.
 
 ## 1. Environment
 
-Recorded 2026-09-19.
+Recorded 2026-09-19; emscripten and `tokenizers` added 2026-09-20.
 
 | Component | Version |
 |---|---|
@@ -36,8 +36,14 @@ Recorded 2026-09-19.
 | onnxruntime | 1.30.0 |
 | onnx | 1.23.0 |
 | numpy | 2.4.6 |
+| tokenizers | 0.23.2 |
 | CPU / RAM | 4 cores / 15 GB |
-| emscripten | not installed (needed for milestone 6) |
+| emscripten | 6.0.9 |
+| SQLite | 3.46.0 (bundled by libsqlite3-sys 0.30.1; the WASM build uses the same amalgamation) |
+
+The Python versions are pinned in `requirements.txt` and installed by `make venv`.
+onnxruntime decides the embeddings and the embeddings decide every quality number
+below, so it is pinned rather than left to float.
 
 ### 1.1 Egress policy
 
@@ -54,6 +60,8 @@ because they shaped several decisions below:
 | **`huggingface.co`, `cdn-lfs.huggingface.co`, `hf-mirror.com`** | **403 at the proxy** |
 | **`drive.google.com`, `drive.usercontent.google.com`** | **403 at the proxy** |
 | `download.pytorch.org`, `ollama.com` | 403 at the proxy |
+| `registry.npmjs.org` | reachable |
+| emscripten SDK (`github.com` + `storage.googleapis.com`) | reachable; `emsdk install latest` works end to end |
 
 Consequences:
 
@@ -62,6 +70,9 @@ Consequences:
 * Model weights were already committed to the repository, so inference is unaffected.
   Tokenizers, which normally come from Hugging Face, had to be sourced separately —
   see §3.
+* The emscripten toolchain that milestone 6 needed installs without trouble; it was
+  simply absent, not blocked. Section 20 records it as available, and section 19 is
+  the work it gated.
 
 ---
 
@@ -135,14 +146,18 @@ lines, matching the model's embedding table row count. Round-tripping
 2858, 2006, 2754, 102]` — `[CLS]`/`[SEP]` at 101/102 and `man` at 2158, all correct
 for `bert-base-uncased`. The similarity table in §2.1 is the end-to-end proof.
 
-### 3.2 Late interaction: open
+### 3.2 Late interaction: was blocked, now resolved
 
 `LateOn-Code-edge` needs its ModernBERT-family BPE tokenizer (vocabulary 50370),
-which normally ships as `tokenizer.json` from Hugging Face — currently 403. The
-project owner indicated a `tokenizer.json` is committed; as of this writing the
-repository contains only `LICENSE`, `README.md` and the two `.onnx` files on
-`trunk`, and no `tokenizer.json` appears anywhere in history. **Milestone 5 is
-blocked on this file.** Everything else proceeds.
+which normally ships as `tokenizer.json` from Hugging Face — 403 at the proxy. For
+the first part of this work the repository carried only `LICENSE`, `README.md` and
+the two `.onnx` files on `trunk`, with no `tokenizer.json` anywhere in history, and
+milestone 5 was blocked on it while everything else proceeded.
+
+**The file was then uploaded to `trunk` and merged in.** Section 14 identifies it,
+confirms it matches the checkpoint's embedding table row for row, and measures the
+late-interaction system with it; sections 15 through 18 all rest on it. Nothing in
+this project is blocked on a tokenizer any more.
 
 ---
 
@@ -197,6 +212,13 @@ Full digests are in `data/corpus/*.manifest.json`.
 **Not committed.** At ~454 MB the 1M corpus would dominate the repository for no
 benefit, since it regenerates byte-identically in 5.4 seconds. `make corpora`
 rebuilds all three scales; manifests carry the digests to check against.
+
+*Checked, not assumed.* On a fresh container with `wamerican` 2020.12.07 installed,
+`make corpora` reproduced all three digests above, and `make ann-10k` run from those
+corpora reproduced every one of the 72 `query_set` rows in the committed
+`bench/results/ann-10k.jsonl` exactly — recall@10, distinct pages, contiguous runs,
+hops and records read, to the last decimal. The determinism claim is a measurement
+rather than a design intention.
 
 ### 4.5 Query sets
 
@@ -1403,20 +1425,22 @@ pipe — and the three architectures differ enormously in hop count.
 | dense | 34–35 | one per beam round; each frontier depends on the last. |
 | **late interaction** | **2–3** | fixed stages: postings, centroid scoring, optional rerank. Independent of corpus size. |
 
-Seconds per query on **`satellite`** (600 ms RTT, 20 Mbit/s):
+Seconds per query on **`satellite`** (600 ms RTT, 20 Mbit/s), from `make concurrency`:
 
 | system | c=1 | c=6 | c=32 | c=128 | floor |
 |---|---:|---:|---:|---:|---:|
 | FTS5 | 7.24 | 7.24 | 7.24 | 7.24 | 7.24 |
-| dense m=64, no rerank | 40.91 | 20.51 | 20.51 | 20.51 | 20.51 |
-| dense m=32, rerank 100 | 84.26 | 21.26 | 21.26 | 21.26 | 21.26 |
+| dense m=64, no rerank | 20.51 | 20.51 | 20.51 | 20.51 | 20.51 |
+| dense m=32, rerank 100 | 63.26 | 21.26 | 21.26 | 21.26 | 21.26 |
 | **late, no rerank** | 26.17 | 5.77 | **2.17** | **2.17** | **2.17** |
 | late, rerank 100 | 87.53 | 17.33 | 6.53 | **4.73** | 4.73 |
 
 **Serially, FTS5 wins by 3.6x. With 32 requests in flight, late interaction wins by
 3.3x** — a complete reversal, from the same measurements, purely by allowing what a
-browser already does. The dense index barely improves past six, because its 34
-dependent rounds are a floor no parallelism touches.
+browser already does. The dense index gains nothing at all without reranking, because
+it issues 33 requests across 34 dependent rounds: there is almost never a second
+request to overlap with, and the rounds are a floor no parallelism touches. With
+reranking its 102 requests do overlap, but only down to the same 21.26 s floor.
 
 The profile decides which term dominates:
 
@@ -1436,6 +1460,53 @@ every table before this one.
 latency-bound once reranking is on: 4.73 s for 3 hops is 1.8 s of round-trips and
 2.9 s of moving 7.3 MB. Section 15.2's unresolved gap — no residual quantization, so
 reranking reads uncompressed vectors — is what puts it there.
+
+### 17.3 The same three systems on the word corpus
+
+Section 17's comparison is on the code corpus, which is the case late interaction was
+built for. The word corpora are the other case, and until now only two of the three
+systems had been measured on them: FTS5 reported `success@1` against a gold document,
+while the dense sweep reported `recall@10` against its own exact search. Those answer
+different questions, so there was no row anyone could put beside another.
+
+Late interaction is now measured there too (`make late-words SCALE=10k`), and the
+dense index re-scored against the same gold (`make ann-gold SCALE=10k`), so all three
+report the same statistic over the same 500 known-item queries:
+
+| system | configuration | success@1 | MRR@10 | pages | requests | hops |
+|---|---|---:|---:|---:|---:|---:|
+| **BM25 (FTS5)** | post-vacuum | **0.826** | **0.875** | **26.6** | **14.4** | 14 |
+| dense (Vamana + PQ) | bfs/resident/L=128/beam=4/rerank=0 | 0.106 | 0.128 | 103.7 | 72.0 | 35 |
+| late interaction | k=1024/probe=8/rerank=0 | 0.268 | 0.302 | 1,267.8 | 57.6 | **2** |
+| late interaction | k=1024/probe=8/rerank=100 | 0.536 | 0.550 | 1,890.0 | 156.7 | 3 |
+
+**Lexical matching wins this corpus outright, on quality and on cost.** That is the
+expected result and it is the point of measuring it: section 5.4 established that
+MiniLM embeddings of fifty unrelated dictionary words carry almost no discrimination,
+and this is what that costs when the three systems are finally scored the same way.
+
+The dense row deserves care, because 0.106 is not a statement about the index. The
+same run recalls **0.757** of its own exact search's top-10, so the graph and the PQ
+codes are doing their job; it is the representation that has nothing to grip. An ANN
+index cannot rank better than the embedding it indexes, and separating those two
+numbers is the only way to see which one is failing. Late interaction lands in
+between, at 0.536, because MaxSim scores individual tokens and a token match on a
+rare dictionary word is not far from what BM25 does.
+
+The cost ranking agrees with the quality ranking here, which it does not at a million
+documents. FTS5 reads 26.6 pages at ten thousand documents and 1,537 at a million
+(section 16.3), because its cost is a per-match lookup that grows with the number of
+matches; the graph index reads 82 at a million. **At ten thousand documents the
+baseline has no case to answer.** The case for everything else in this project begins
+where FTS5's page count stops being small.
+
+*Not measured: late interaction at a million documents.* Encoding is not the obstacle
+— 306 documents/s means about 54 minutes — but the intermediate float32 file is
+110.7 tokens x 48 dims x 4 bytes x 1M, which is **21 GB**, and the exact-rerank arena
+is another 21 GB. At two-bit residuals (section 18.1) the *index* would be about
+1.8 GB, so what blocks the measurement is the uncompressed intermediate rather than
+the storage format. A streaming encode-and-quantize path would remove it, and that is
+the concrete next step for anyone wanting this row.
 
 ---
 
@@ -1500,10 +1571,204 @@ The flag is now measured rather than asserted. `LoadWitness` samples
 hardcoding `contended: true` was honest while it was true and would have gone
 silently stale the moment the box went quiet, which is exactly what happened.
 
+### 18.3 Finding: an append-only results file hid its own re-measurements
+
+Re-running section 18.2's measurement surfaced a bug in the instrument rather than in
+the index. `late_pages` opened `bench/results/tri-late.jsonl` in **append** mode,
+while both readers in `tools/analyze` selected the **first** row matching a
+`(system, config)` pair. A re-run therefore did not replace an earlier measurement --
+it hid behind it. The file held every late-interaction row twice, and the tables kept
+publishing the older one.
+
+What it cost is worth being precise about, because the honest answer is "almost
+nothing, by luck". The shadowed pair for `k=1024/probe=8/rerank=100` was 61.92 ms
+published against 47.74 ms hidden, which looks like a 23% overstatement. Re-measuring
+on an idle machine gives **60.0 ms**. So the published figure was near enough right
+and the *hidden* row was the outlier — the opposite of what the shapes of the two
+numbers suggest. Had the run order been reversed, the same bug would have published
+the outlier instead, and nothing in the file would have said so.
+
+Two changes, because either alone leaves a way to be wrong:
+
+* `late_pages` truncates its output file, so one run produces one complete set of
+  rows and a stale row cannot survive a re-run.
+* The readers take the **last** match rather than the first, so a file that does
+  somehow accumulate duplicates publishes its most recent measurement.
+
+The other benchmarks were checked for the same pattern and do not have it: the dense
+sweep and the FTS5 runs rewrite their files, and `tri-code.jsonl` is regenerated by
+`tri_code.py` rather than appended to. This was specific to the one benchmark that
+appended.
+
 ---
 
-## 19. Open items
+## 19. SQLite compiled to WASM, and a client that does not speculate
 
-* **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
-* **Needed:** an emscripten toolchain for the WASM milestone.
-* Out of scope this pass: LLM-written paragraph corpora (§1.1).
+Milestone 6 needed an emscripten toolchain, which section 1 recorded as simply not
+installed. It installs without trouble; nothing was blocking it. This is the work it
+gated.
+
+### 19.1 Why the vendored client could not answer the question
+
+Section 13.2 found that `sql.js-httpvfs` treats `requestChunkSize` as a floor rather
+than a cap: its speculative read heads double their request size until they have
+swallowed the file, so one query against the 5.9 MB demo database pulled about
+5.2 MB. That makes it useless as an instrument for this project. **Any amount of
+page-locality work in the index is invisible to a client that has already downloaded
+everything**, and section 13.4's crossover question — at what scale does fetching
+ranges beat fetching the file — could not be asked through SQLite at all.
+
+So the missing piece was never a better index. It was a SQLite that fetches what it
+asks for.
+
+### 19.2 The build
+
+`web/sqlite-wasm` (`make sqlite-wasm`) compiles the **same amalgamation the native
+benchmarks link** — SQLite 3.46.0, the one `libsqlite3-sys` already vendored — to
+WebAssembly, with a read-only VFS whose `xRead(offset, amt)` issues exactly one HTTP
+Range request for exactly `[offset, offset+amt)`. No read-ahead, no speculation, no
+caching. Using the same amalgamation is deliberate: a difference between the browser
+and native page counts is then a difference in the VFS and cannot be a difference in
+the engine.
+
+Synchronous `xRead` over asynchronous `fetch` is emscripten's ASYNCIFY, which
+suspends the WASM stack while a request is in flight and resumes it where it left
+off. That is the whole reason this needed emscripten rather than the
+`wasm32-unknown-unknown` target the rest of the browser code uses: `wasm-bindgen`
+gives Rust in the browser, but it does not give a C library a way to block.
+
+**Everything is counted twice.** The VFS counts what SQLite asked for; the network
+simulator's request log counts what arrived. They are different processes, and
+`range_compare.py` discards any run in which they disagree — a disagreement would
+mean something between them is caching or coalescing, which would make every page
+number meaningless. This is the discipline section 9.3 used when it checked a
+pass-through VFS against `SQLITE_DBSTATUS_CACHE_MISS` on 9,000 of 9,000 queries.
+
+### 19.3 Measured: what a non-speculating client fetches
+
+Same 5,890,048-byte demo database as section 13, `make range-demo`:
+
+| operation | pages | requests | bytes | of file |
+|---|---:|---:|---:|---:|
+| open (header + schema) | 1 | 1 | 100 | 0.00% |
+| point lookup, 1 node | 3 | 3 | 12,288 | **0.21%** |
+| 4 nodes, scattered ids | 6 | 6 | 24,576 | 0.42% |
+| **4 nodes, adjacent ids** | **3** | **3** | **12,288** | **0.21%** |
+| document text, 1 doc | 3 | 3 | 12,288 | 0.21% |
+| resident code blob | 2 | 2 | 8,192 | 0.14% |
+| full table scan | 71 | 71 | 290,816 | 4.94% |
+| **`sql.js-httpvfs`, one query (§13.2)** | — | 6 | **~5,200,000** | **~88%** |
+
+**A point lookup costs 12 KB where the vendored client cost 5.2 MB** — the same
+database, the same engine, a factor of about 430. The index was never what cost
+5.2 MB; the client's caching policy was.
+
+Two details are worth more than the headline.
+
+*The two four-node rows are the page-locality result, visible through SQLite for the
+first time.* The same number of records costs **six** pages when their ids are
+scattered and **three** when they are adjacent — the adjacent case is no more
+expensive than fetching a single record. The saving is specifically the leaf: SQLite
+shares the root and interior pages across the four lookups either way, which is why
+scattered costs six rather than twelve, but only adjacency puts the four records on
+one leaf. Breadth-first ordering (section 11.4) is what makes a graph frontier's
+records adjacent, and this is the first measurement in this project showing that
+ordering pay off through a real SQLite client rather than through a flat file.
+Section 13.2 is precisely the reason it never could before.
+
+*Three pages for one row is the B-tree, not the record format.* SQLite descends root,
+interior, leaf, and no layout makes that two. A client reading the flat sidecar files
+computes the offset and fetches exactly one range (section 13.3). What SQLite costs
+in those extra two pages it returns as everything else a database does, including the
+FTS5 baseline living in the same file.
+
+### 19.4 The crossover question, answered
+
+Section 13.4 established a question and said plainly that it could not answer it: at
+2,000 documents the client that swallows the database wins, so *where* does that stop
+being true? It could not be answered then because the only SQLite client available
+swallowed the file whatever the index did.
+
+The same measurement at two scales, 46x apart in size:
+
+| | 5.9 MB / 2,000 docs | 274.5 MB / 100,000 docs |
+|---|---:|---:|
+| point lookup | 3 pages | **4 pages** |
+| 4 nodes, scattered ids | 6 pages | **7 pages** |
+| 4 nodes, adjacent ids | 3 pages | **4 pages** |
+| full table scan | 71 pages | 3,563 pages |
+| whole file | 1,438 pages | 67,024 pages |
+
+**Forty-six times the data costs one extra page on a point lookup.** That is the
+B-tree gaining a level, and it is the whole argument for range requests stated in one
+row: the query's cost grows with the logarithm of the corpus while "just download it"
+grows linearly with it. The full scan is there as the control — it *does* grow
+linearly, because it must read everything.
+
+Converting the measured counts with the cost model of section 8, and charging a
+traversal one dependent round per beam round at the hop counts the dense sweep
+measured (20 at the small scale, 37.5 at 100,000). Each round is charged at the
+**scattered** four-node cost, 6 pages and 7, rather than the adjacent one: a real
+frontier is neither perfectly ordered nor fully scattered, and taking the worse of
+the two measured figures keeps the conclusion on the safe side of the crossover.
+
+| profile | scale | traversal | download whole file | winner |
+|---|---|---:|---:|---|
+| `lte` | 5.9 MB | 1.66 s | 3.21 s | ranges, 1.9x |
+| `lte` | 274.5 MB | 5.90 s | 146.49 s | **ranges, 24.8x** |
+| `satellite` | 5.9 MB | 12.20 s | 2.96 s | **whole file, 4.1x** |
+| `satellite` | 274.5 MB | 46.04 s | 110.41 s | ranges, 2.4x |
+
+**The satellite row reproduces section 13.4's result exactly** — at 2,000 documents
+the naive client wins by a factor of four — **and then reverses it at 100,000.** That
+is the crossover, and it sits between those two scales on the worst link tested. On
+`lte` it has already happened by 2,000 documents.
+
+The mechanism is the one this project keeps finding. Downloading pays bandwidth,
+which scales with corpus size. Traversing pays `hops x RTT`, which scales with the
+logarithm of it. A 600 ms link makes the second term expensive enough that a small
+database is better swallowed whole; no link makes 274 MB better swallowed whole.
+
+*What this composes and what it measures.* The page and request counts are measured
+end to end through SQLite. The traversal row multiplies a measured per-round cost by
+a separately measured hop count rather than driving a full search through the WASM
+client, so it is a composition of two measurements and is labelled as one. Driving
+the complete beam search through this VFS is the obvious next step and needs the
+`annlite-wasm` scorer beside it in the same module.
+
+---
+
+## 20. Open items
+
+**Closed since the last pass.**
+
+* `tokenizer.json` for `LateOn-Code-edge` arrived and was merged; §3.2 and §14. Every
+  late-interaction result from §14 onward rests on it. Nothing is blocked on it.
+* The emscripten toolchain is installed (6.0.9) and the WASM milestone is done: §19
+  builds SQLite 3.46.0 with a bounded-range VFS and answers §13.4's crossover
+  question with it.
+* Late interaction is measured on a word corpus as well as the code corpus, so all
+  three systems are now comparable on one quality statistic at 10,000 documents
+  (§17.3).
+* Residual quantization closes §15.2's storage gap (§18.1) and its measurements are
+  committed rather than printed (`bench/results/residual-code.jsonl`).
+
+**Open.**
+
+* **Late interaction at a million documents** (§17.3). Not blocked on compute —
+  encoding is about 54 minutes — but on the 21 GB uncompressed intermediate the
+  current pipeline writes before quantizing. A streaming encode-and-quantize path
+  would bring the index to roughly 1.8 GB at two-bit residuals and make the row
+  measurable. This is the largest missing cell in the results matrix.
+* **A full beam search driven through the WASM VFS** (§19.4). The per-round cost and
+  the hop count are both measured, but separately; composing them is honest and is
+  not the same as one end-to-end run. It needs the `annlite-wasm` scorer loaded
+  beside the SQLite module.
+* **No FTS5 baseline at 100,000 documents.** `SCALES` covers 100, 10k and 1M, while
+  the dense sweep also covers 100k, so the one scale with a demo database large
+  enough to be interesting has no lexical baseline to compare against.
+* **The httpvfs comparison in §19.3 quotes §13.2 rather than re-running it.** Driving
+  `sql.js-httpvfs` needs a browser harness; the bounded-range client runs under Node.
+  A committed Playwright driver would let both be measured in one command.
+* Out of scope this pass: LLM-written paragraph corpora (§1.1), which need a model
+  the proxy will not serve.

@@ -44,6 +44,8 @@ FTS5 at a million documents, measured with a pass-through VFS that agreed with
 | 10,000 | 26 | 104 | 1.9 s |
 | **1,000,000** | **1,537** | **6,148** | **111 s** |
 
+`make fts5` produces these, into `bench/results/fts5-*.jsonl`.
+
 Head to head at a million documents, same corpus, same queries:
 
 | system | pages | requests | `lte` | satellite |
@@ -78,6 +80,9 @@ parameters within each scale, so differences are attributable to layout alone.
 | 100,000 | 1,291 | 1,135 | **660** | 861 | **355** |
 | 1,000,000 | 1,544 | 1,519 | **994** | 1,470 | **756** |
 
+`make ann` produces these (or `ann-10k` / `ann-100k` / `ann-1m` individually; the 1M
+index builds for about two hours, so it is worth starting on its own).
+
 Records read grows only 978 → 1,544 across a hundredfold increase in corpus size —
 the graph is doing its job. What grows is how many *pages* those records scatter
 over, which is what ordering and residency attack.
@@ -92,6 +97,7 @@ only for a node the search *expands* — is the larger and independent lever:
 | 1,000,000 | 1,544 | **59** | **47** |
 
 At a million documents the two levers compose to turn **1,470 requests into 47**.
+Residency is a mode within the same `make ann` sweep, not a separate build.
 
 Recall is identical to three decimals in every pair, as it must be — the same nodes
 are scored either way, and a test pins it.
@@ -120,14 +126,23 @@ As a fraction of the 0.962 attainable: BM25 0.291, dense 0.364, late interaction
 **0.472**.
 
 Late interaction is 62% better than BM25 and 30% better than dense. The compression
-story needs care, though, because the cheap configuration and the accurate one are
-not the same configuration. PLAID's centroid representation is 43.7x smaller than raw
-token vectors, but that configuration scores 0.240; reaching 0.454 means reranking
-against uncompressed vectors, which puts the stored file back at 29 KB per document.
-This implementation has PLAID's staging and centroid compression but **not its
-residual quantization**, which is what would let reranking happen in the compressed
-domain. That is the clearest open gap in the project. (Per-query latency is omitted: these runs shared a machine
-with a million-document index build, so quality is trustworthy and timing is not.)
+story needs care, because the cheap configuration and the accurate one are not the
+same configuration. PLAID's centroid representation is 43.7x smaller than raw token
+vectors, but on its own it scores 0.240; reaching 0.454 means reranking against
+uncompressed vectors, which puts the stored file back at 29 KB per document.
+
+**Residual quantization closes most of that gap.** Keeping a few bits of
+`v - centroid[c]` per dimension lets reranking read a reconstruction instead of a
+stored vector: at two bits that is 2,411 bytes per document — 8.5% of the exact
+configuration's storage for 85% of its success@1. It does not close the gap
+entirely, and the shape of the shortfall is worth stating: doubling from two bits to
+four buys 0.012 of success@1 and still does not reach 0.454, so past two bits the
+quantizer is no longer what limits the ranking.
+[`make residual`](Makefile) reproduces the curve; [RESEARCH_LOG §18.1](RESEARCH_LOG.md).
+
+(Per-query latency is omitted from this table: these runs shared a machine with a
+million-document index build, so quality is trustworthy and timing is not.
+[RESEARCH_LOG §18.2](RESEARCH_LOG.md) re-measures the compute axis on an idle box.)
 
 Late interaction now has a SQLite form with the same page accounting as the dense
 index, so its cost is comparable and not only its quality. Mean per query over the
@@ -138,6 +153,8 @@ same 500 queries, 1,024 centroids:
 | candidate generation (postings) | 108 | 40 | 175 KB |
 | centroid interaction | 484 | **2** | 1.98 MB |
 | exact rerank of 100 | **1,199** | **97** | 4.51 MB |
+
+`make late-pages` produces these.
 
 **Two dependent hops without reranking, three with** — there is no graph to walk, and
 that does not change with corpus size. Reranking is 67% of the pages, as it was for
@@ -150,6 +167,51 @@ counts only codes and centroids: a file that can answer a query also carries the
 inverted lists and that directory, so it is **928 bytes per document** — and 29,196
 if the configuration reranks exactly, because that needs the uncompressed vectors.
 [RESEARCH_LOG §15.4](RESEARCH_LOG.md).
+
+### The same three systems on the word corpus
+
+The table above is the code corpus, which is what late interaction was built for.
+On 10,000 documents of fifty random dictionary words — scored the same way, against
+the same 500 known-item queries and the same gold document — the ranking inverts:
+
+| system | success@1 | MRR@10 | pages | requests | hops |
+|---|---:|---:|---:|---:|---:|
+| **BM25 (FTS5)** | **0.826** | **0.875** | **26.6** | **14.4** | 14 |
+| dense (Vamana + PQ, resident) | 0.106 | 0.128 | 103.7 | 72.0 | 35 |
+| late interaction (rerank 100) | 0.536 | 0.550 | 1,890.0 | 156.7 | **3** |
+
+**Lexical matching wins this corpus outright, on quality and on cost**, and that is
+the expected result: a document of fifty unrelated dictionary words has no topic for
+an embedding to capture. The dense row is not an indexing failure — the same run
+recalls 0.757 of its own exact search's top-10 — it is the representation having
+nothing to grip. The case for the graph index starts where FTS5's per-match lookups
+stop being cheap, which is around a million documents, not ten thousand.
+
+`make fts5-10k`, `make ann-gold SCALE=10k` and `make late-words SCALE=10k` produce
+these. [RESEARCH_LOG §17.3](RESEARCH_LOG.md).
+
+### SQLite in the browser, fetching only what it reads
+
+`make sqlite-wasm` builds SQLite 3.46.0 — the same amalgamation the native benchmarks
+link — to WebAssembly, with a read-only VFS that issues one HTTP Range request per
+`xRead` for exactly the bytes asked for. Every run is counted twice, by the VFS and
+by the server's request log, and discarded unless they agree.
+
+| | 5.9 MB / 2,000 docs | 274.5 MB / 100,000 docs |
+|---|---:|---:|
+| point lookup | 3 pages, 12 KB | **4 pages, 16 KB** |
+| 4 nodes, scattered ids | 6 pages | 7 pages |
+| 4 nodes, adjacent ids | 3 pages | 4 pages |
+| whole file | 1,438 pages | 67,024 pages |
+
+**Forty-six times the data costs one extra page**, because that is the B-tree gaining
+a level. The two four-node rows are the ordering result: adjacent records share a
+leaf and cost no more than a single lookup, scattered ones do not. Converting with the cost model, a traversal against the 274.5 MB database
+costs 5.9 s on `lte` where downloading it costs 146 s — and on `satellite` the
+2,000-document case still favours downloading by 4.1x, exactly as
+[RESEARCH_LOG §13.4](RESEARCH_LOG.md) found, while the 100,000-document case reverses
+it. That is the crossover §13.4 posed and could not answer.
+`make range-demo`; [RESEARCH_LOG §19](RESEARCH_LOG.md).
 
 ### Traps found along the way
 
@@ -164,9 +226,17 @@ if the configuration reranks exactly, because that needs the uncompressed vector
   degenerates into a kNN graph and recall falls from 0.93 to 0.06.
 * **The httpvfs client can defeat the whole exercise.** `sql.js-httpvfs` escalates
   its read-ahead past a megabyte and pulls a 5.9 MB database whole on the first
-  query. Bounded Range requests against the flat record format move 9.1 KB per query
-  instead of 512 KB — but in 69 requests rather than one, which is *slower* on a
-  70 ms link. At small scale, downloading everything wins.
+  query, so no amount of page-locality work in the index is visible through it.
+  Building SQLite to WASM with a VFS that fetches exactly what it asks for
+  (`make sqlite-wasm`) costs **12 KB for a point lookup on that same database** —
+  about 430x less — and makes page locality visible through SQLite for the first
+  time: four records cost six pages when their ids are scattered and three when they
+  are adjacent, which is no more than fetching one.
+* **An append-only results file hid its own re-measurements.** One benchmark appended
+  to its JSONL while the readers took the *first* matching row, so every re-run
+  landed behind the measurement it was meant to replace. The file is truncated per
+  run now, and the readers take the last match.
+  [RESEARCH_LOG §18.3](RESEARCH_LOG.md).
 
 ## Models
 
@@ -188,21 +258,39 @@ diffs them over 615 lines of awkward input.
 
 ```sh
 apt-get install wamerican      # supplies /usr/share/dict/words
+make venv                      # .venv from the pinned requirements.txt
 make                           # list every target
 
+# data
 make corpora queries           # regenerate the word corpora (1M rebuilds in 5.4 s)
 make code-corpus               # build the docstring-to-code corpus
-make fts5                      # FTS5 baseline at all scales
-make code-eval                 # BM25 vs dense vs late interaction
-make matrix                    # join every result into docs/RESULTS.md
 
-make matrix                    # regenerate docs/RESULTS.md from committed results
+# measurement
+make fts5                      # FTS5 baseline at all scales
+make ann                       # dense sweep at 10k / 100k / 1M
+make code-eval                 # BM25 vs dense vs late interaction, code corpus
+make late-pages                # late interaction in SQLite, with page accounting
+make late-words SCALE=10k      # late interaction on the word corpus
+make residual                  # residual quantization: storage against quality
+
+# reporting -- reads only committed results, no benchmark re-run
+make matrix                    # regenerate docs/RESULTS.md
 make concurrency               # seconds per query against requests in flight
+
+# browser
+make sqlite-wasm               # SQLite 3.46.0 + bounded-range VFS, via emscripten
+make range-demo                # what a non-speculating SQLite client actually fetches
+make demo && make demo-serve   # browser demo, served through the simulator
+
+# checks
 make test                      # Rust test suite
 make tokenizer-parity          # Rust and Python tokenizers must agree exactly
 make wasm-test                 # browser build must match the native one
-make demo && make demo-serve   # browser demo, served through the simulator
 ```
+
+Every measurement target writes to `bench/results/`, and every table below names the
+target that produced it. `make matrix` and `make concurrency` read those files only,
+so any figure can be rechecked without re-running a benchmark.
 
 ## Data is generated, not committed
 
@@ -225,6 +313,12 @@ Each corpus is a byte-exact prefix of the next, so scale curves describe one gro
 collection rather than three unrelated samples. Benchmark *outputs* are committed —
 they are the evidence behind every number above, and they are only a few megabytes.
 
+The chain was checked end to end on a clean container: regenerating the corpora from
+the system dictionary reproduces the SHA-256 digests in
+[RESEARCH_LOG §4.4](RESEARCH_LOG.md), and re-running `make ann-10k` from those
+corpora reproduces all 72 rows of the committed `bench/results/ann-10k.jsonl` with
+**no field differences** — recall, pages, runs, hops and records read all identical.
+
 ## Layout
 
 ```
@@ -234,6 +328,7 @@ crates/annlite-fts5      FTS5 baseline: build cost, latency, quality, page acces
 crates/annlite-netsim    HTTP range server with latency/throughput simulation
 crates/annlite-sqlite    SQLite storage format and the page-locality experiment
 crates/annlite-wasm      browser bindings: tokenizer, PQ scoring, resumable search
+web/sqlite-wasm          SQLite built to WASM with a bounded-range HTTP VFS
 tools/embed              ONNX encoders and the Python WordPiece tokenizer
 tools/corpus             the docstring-to-code corpus builder
 tools/analyze            network cost model, tokenizer diff, results matrix
@@ -245,8 +340,15 @@ docs/RESULTS.md          generated results matrix
 
 ## Status
 
-Everything above is built and measured. Million-document dense measurements are
-running; the 1M FTS5 baseline is complete.
+Everything above is built and measured, at every scale the tables name. The
+million-document dense measurements and the 1M FTS5 baseline are both complete, all
+three retrieval systems are measured on both corpora, and SQLite now runs in the
+browser against a remote file through a VFS this project controls.
+
+The largest missing cell is **late interaction at a million documents**: encoding is
+only about an hour, but the pipeline writes a 21 GB uncompressed intermediate before
+quantizing, and a streaming encode-and-quantize path would bring the index to roughly
+1.8 GB. [RESEARCH_LOG §20](RESEARCH_LOG.md) lists what else is open.
 
 ## License
 

@@ -273,9 +273,84 @@ this one includes it, which is the comparison that decides the design.
 
 | system | success@1 | success@10 | success@100 | MRR@10 | bytes/doc | ms/query |
 |---|---:|---:|---:|---:|---:|---:|
-| BM25 (FTS5) | 0.280 | 0.542 | 0.762 | 0.362 | — | 2.57 |
-| Dense (MiniLM) | 0.350 | 0.698 | 0.932 | 0.463 | 1,536 | 0.31 |
-| Late interaction (LateOn) | 0.454 | 0.780 | 0.950 | 0.567 | 28,240 | 120.03 |
+| BM25 (FTS5) | 0.280 | 0.542 | 0.762 | 0.362 | — | 2.25 |
+| Dense (MiniLM) | 0.350 | 0.698 | 0.932 | 0.463 | 1,536 | 0.21 |
+| Late interaction (LateOn) | 0.454 | 0.780 | 0.950 | 0.567 | 28,240 | 56.60 |
+
+## SQLite over bounded HTTP ranges
+
+SQLite 3.46.0 compiled to WASM with a VFS that issues one Range request per
+`xRead`, for exactly the bytes asked for. Counted independently by the VFS
+and by the simulator's request log; a run is discarded unless they agree.
+Produced by `make range-demo`.
+
+**`annlite-demo.db`** — 5,890,048 bytes, 1,438 pages.
+
+| operation | pages | requests | bytes | of file |
+|---|---:|---:|---:|---:|
+| open only | 1 | 1 | 100 | 0.00% |
+| point lookup (1 node) | 3 | 3 | 12,288 | 0.21% |
+| 4 nodes, scattered ids | 6 | 6 | 24,576 | 0.42% |
+| 4 nodes, adjacent ids | 3 | 3 | 12,288 | 0.21% |
+| document text (1 doc) | 3 | 3 | 12,288 | 0.21% |
+| resident code blob | 2 | 2 | 8,192 | 0.14% |
+| full table scan | 71 | 71 | 290,816 | 4.94% |
+
+**`annlite-demo-100k.db`** — 274,530,304 bytes, 67,024 pages.
+
+| operation | pages | requests | bytes | of file |
+|---|---:|---:|---:|---:|
+| open only | 1 | 1 | 100 | 0.00% |
+| point lookup (1 node) | 4 | 4 | 16,384 | 0.01% |
+| 4 nodes, scattered ids | 7 | 7 | 28,672 | 0.01% |
+| 4 nodes, adjacent ids | 4 | 4 | 16,384 | 0.01% |
+| document text (1 doc) | 4 | 4 | 16,384 | 0.01% |
+| resident code blob | 2 | 2 | 8,192 | 0.00% |
+| full table scan | 3,563 | 3,563 | 14,594,048 | 5.32% |
+
+## Three systems on the word corpus
+
+10,000 documents of fifty random dictionary words, 500 known-item queries,
+one gold document each. `success@1` is against that gold for all three, so
+the column means the same thing in every row.
+
+Produced by `make fts5-10k`, `make ann-gold SCALE=10k` and
+`make late-words SCALE=10k`.
+
+| system | configuration | success@1 | MRR@10 | pages | requests | hops |
+|---|---|---:|---:|---:|---:|---:|
+| **BM25 (FTS5)** | post-vacuum | **0.826** | **0.875** | 26.6 | 14.4 | 14 |
+| dense (Vamana + PQ) | bfs/resident/L=128/beam=4/rerank=0 | 0.106 | 0.128 | 103.7 | 72.0 | 35 |
+| late interaction | k=1024/probe=8/rerank=0 | 0.268 | 0.302 | 1,267.8 | 57.6 | 2 |
+| late interaction | k=1024/probe=8/rerank=100 | 0.536 | 0.550 | 1,890.0 | 156.7 | 3 |
+
+**Lexical matching wins this corpus outright, on both axes.** That is the
+expected result and it is worth stating plainly: a document of fifty
+unrelated dictionary words has no topic for an embedding to capture, so
+section 5.4's finding shows up here as a 0.826 against 0.536 and 0.106.
+The dense index is not failing as an index -- it recovers 0.757 of its own
+exact search's top-10 -- it is the representation that has nothing to grip.
+Late interaction lands in between because MaxSim scores individual tokens,
+which is closer to what a term match does.
+
+The cost ranking is the same: FTS5 reaches 26.6 pages where the dense index
+needs 103.7 and late interaction 1,890. The case for the graph index is at
+a million documents, where FTS5's per-match lookups stop being cheap
+(section 16.3); at ten thousand it has no case to make.
+
+## Residual quantization (late interaction)
+
+Reranking against centroid+residual reconstructions rather than against
+stored float32 vectors. `bytes/doc` is everything a client holds, so the
+rows are directly comparable with the bytes/doc column above.
+
+| residual bits | bytes/token | bytes/doc | vs exact | success@1 | success@10 | MRR@10 |
+|---|---:|---:|---:|---:|---:|---:|
+| none (centroid only) | 4 | 646 | 48.0x | 0.240 | 0.578 | 0.343 |
+| 1 | 10 | 1,529 | 19.2x | 0.322 | 0.650 | 0.425 |
+| 2 | 16 | 2,411 | 12.0x | 0.388 | 0.718 | 0.493 |
+| 4 | 28 | 4,176 | 6.9x | 0.400 | 0.742 | 0.520 |
+| exact float32 | 192 | 28,239 | 1.0x | 0.454 | 0.780 | 0.567 |
 
 ## Three systems on one corpus
 
@@ -289,11 +364,11 @@ the absolute values are an upper bound.
 
 | system | configuration | success@1 | of max | MRR@10 | pages | requests | bytes/doc | cpu ms |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| fts5 | post-vacuum | 0.280 | 0.291 | 0.362 | 25.5 | 12.3 | 764 | 2.09 |
-| dense | bfs/resident/L=128/beam=4/rerank=0/m=64 | 0.348 | 0.362 | 0.456 | 67.4 | 66.7 | 2,420 | 1.06 |
-| dense | bfs/resident/L=128/beam=4/rerank=100/m=32 | 0.348 | 0.362 | 0.461 | 158.6 | 125.9 | 2,352 | 1.61 |
-| late | k=1024/probe=8/rerank=0 | 0.240 | 0.249 | 0.343 | 592.1 | 41.8 | 928 | 23.76 |
-| late | k=1024/probe=8/rerank=100 | 0.454 | 0.472 | 0.563 | 1,790.8 | 138.7 | 29,196 | 61.92 |
+| fts5 | post-vacuum | 0.280 | 0.291 | 0.362 | 25.5 | 12.3 | 764 | 1.90 |
+| dense | bfs/resident/L=128/beam=4/rerank=0/m=64 | 0.348 | 0.362 | 0.456 | 67.4 | 32.6 | 2,420 | 1.04 |
+| dense | bfs/resident/L=128/beam=4/rerank=100/m=32 | 0.348 | 0.362 | 0.461 | 158.6 | 102.4 | 2,352 | 1.53 |
+| late | k=1024/probe=8/rerank=0 | 0.240 | 0.249 | 0.343 | 592.1 | 41.8 | 928 | 23.48 |
+| late | k=1024/probe=8/rerank=100 | 0.454 | 0.472 | 0.563 | 1,790.8 | 138.7 | 29,196 | 60.00 |
 
 ### Requests in flight
 
@@ -311,8 +386,8 @@ client, not of the index.
 | system | hops | requests | c=1 | c=6 | c=32 | c=128 | floor |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | FTS5 | 12 | 12 | 896 ms | 896 ms | 896 ms | 896 ms | **896 ms** |
-| dense m=64, no rerank | 34 | 67 | 4.9 s | 2.5 s | 2.5 s | 2.5 s | **2.5 s** |
-| dense m=32, rerank 100 | 35 | 126 | 10.1 s | 2.8 s | 2.8 s | 2.8 s | **2.8 s** |
+| dense m=64, no rerank | 34 | 33 | 2.5 s | 2.5 s | 2.5 s | 2.5 s | **2.5 s** |
+| dense m=32, rerank 100 | 35 | 102 | 7.7 s | 2.8 s | 2.8 s | 2.8 s | **2.8 s** |
 | late k=1024, no rerank | 2 | 42 | 4.2 s | 1.9 s | 1.4 s | 1.4 s | **1.4 s** |
 | late k=1024, rerank 100 | 3 | 139 | 13.8 s | 5.6 s | 4.3 s | 4.1 s | **4.1 s** |
 
@@ -321,8 +396,8 @@ client, not of the index.
 | system | hops | requests | c=1 | c=6 | c=32 | c=128 | floor |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | FTS5 | 12 | 12 | 2.9 s | 2.9 s | 2.9 s | 2.9 s | **2.9 s** |
-| dense m=64, no rerank | 34 | 67 | 15.0 s | 8.2 s | 8.2 s | 8.2 s | **8.2 s** |
-| dense m=32, rerank 100 | 35 | 126 | 31.2 s | 10.2 s | 10.2 s | 10.2 s | **10.2 s** |
+| dense m=64, no rerank | 34 | 33 | 8.2 s | 8.2 s | 8.2 s | 8.2 s | **8.2 s** |
+| dense m=32, rerank 100 | 35 | 102 | 24.2 s | 10.2 s | 10.2 s | 10.2 s | **10.2 s** |
 | late k=1024, no rerank | 2 | 42 | 20.5 s | 13.7 s | 12.5 s | 12.5 s | **12.5 s** |
 | late k=1024, rerank 100 | 3 | 139 | 64.9 s | 41.5 s | 37.9 s | 37.3 s | **37.3 s** |
 
@@ -331,8 +406,8 @@ client, not of the index.
 | system | hops | requests | c=1 | c=6 | c=32 | c=128 | floor |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | FTS5 | 12 | 12 | 7.2 s | 7.2 s | 7.2 s | 7.2 s | **7.2 s** |
-| dense m=64, no rerank | 34 | 67 | 40.9 s | 20.5 s | 20.5 s | 20.5 s | **20.5 s** |
-| dense m=32, rerank 100 | 35 | 126 | 84.3 s | 21.3 s | 21.3 s | 21.3 s | **21.3 s** |
+| dense m=64, no rerank | 34 | 33 | 20.5 s | 20.5 s | 20.5 s | 20.5 s | **20.5 s** |
+| dense m=32, rerank 100 | 35 | 102 | 63.3 s | 21.3 s | 21.3 s | 21.3 s | **21.3 s** |
 | late k=1024, no rerank | 2 | 42 | 26.2 s | 5.8 s | 2.2 s | 2.2 s | **2.2 s** |
 | late k=1024, rerank 100 | 3 | 139 | 87.5 s | 17.3 s | 6.5 s | 4.7 s | **4.7 s** |
 
