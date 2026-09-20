@@ -15,6 +15,10 @@ fetched as well as milliseconds.
 Full tables and methodology: **[RESEARCH_LOG.md](RESEARCH_LOG.md)**.
 Generated results matrix: **[docs/RESULTS.md](docs/RESULTS.md)**.
 
+Every number in either document traces to a committed measurement file under
+`bench/results/`, and `make matrix` regenerates the matrix from them
+deterministically — no benchmark re-run needed to check a figure.
+
 ## The finding the rest follows from
 
 Thirty-two sequential 4 KiB page fetches, 128 KiB of payload:
@@ -190,6 +194,8 @@ make fts5                      # FTS5 baseline at all scales
 make code-eval                 # BM25 vs dense vs late interaction
 make matrix                    # join every result into docs/RESULTS.md
 
+make matrix                    # regenerate docs/RESULTS.md from committed results
+make concurrency               # seconds per query against requests in flight
 make test                      # Rust test suite
 make tokenizer-parity          # Rust and Python tokenizers must agree exactly
 make wasm-test                 # browser build must match the native one

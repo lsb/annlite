@@ -25,10 +25,27 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tools"))
 
-from analyze.netcost import PAGE_BYTES, PROFILES, Access, query_seconds, session_seconds  # noqa: E402
+from analyze.netcost import (  # noqa: E402
+    CONCURRENCY_LEVELS,
+    PAGE_BYTES,
+    PROFILES,
+    Access,
+    query_seconds,
+    session_seconds,
+)
 
 RESULTS = REPO / "bench" / "results"
 PROFILE_ORDER = ["ideal", "wifi", "5g", "lte", "3g", "satellite"]
+
+#: One representative configuration per system, chosen so the comparison is legible.
+#: The full sweeps are in the JSONL files these are drawn from.
+HEADLINE_CONFIGS = [
+    ("fts5", "post-vacuum"),
+    ("dense", "bfs/resident/L=128/beam=4/rerank=0/m=64"),
+    ("dense", "bfs/resident/L=128/beam=4/rerank=100/m=32"),
+    ("late", "k=1024/probe=8/rerank=0"),
+    ("late", "k=1024/probe=8/rerank=100"),
+]
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -213,6 +230,60 @@ def main() -> int:
             w(f"| {name} | {m['success@1']:.3f} | {m['success@10']:.3f} | "
               f"{m['success@100']:.3f} | {m['mrr@10']:.3f} | {bpd} | {m['ms_per_query']:.2f} |")
         w("")
+
+    # --- three systems on one corpus ---------------------------------------
+    tri = load_jsonl(RESULTS / "tri-code.jsonl") + load_jsonl(RESULTS / "tri-late.jsonl")
+    if tri:
+        w("## Three systems on one corpus\n")
+        w("Code corpus, 3,366 documents, 500 queries. Same single-gold quality")
+        w("definition for all three, and the same pass-through VFS counting real file")
+        w("pages. `success@1` has a ceiling of 0.962: 7.4% of queries share a docstring")
+        w("with another function and cannot be answered as known-item retrieval.\n")
+        w("CPU is process time measured under contention — the ordering is meaningful,")
+        w("the absolute values are an upper bound.\n")
+        w("| system | configuration | success@1 | of max | MRR@10 | pages | requests | bytes/doc | cpu ms |")
+        w("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+        for sysname, cfg in HEADLINE_CONFIGS:
+            r = next((x for x in tri if x["system"] == sysname and x["config"] == cfg), None)
+            if not r:
+                continue
+            q = r["quality"]
+            w(f"| {sysname} | {cfg} | {q['success@1']:.3f} | {q['success@1'] / 0.962:.3f} | "
+              f"{q['mrr@10']:.3f} | {r['pages']['mean']:,.1f} | {r['requests']['mean']:,.1f} | "
+              f"{r['bytes_per_doc']:,.0f} | {r['cpu_ms_per_query']:.2f} |")
+        w("")
+
+        # --- what parallelism does ------------------------------------------
+        w("### Requests in flight\n")
+        w("Requests within a hop overlap, because their addresses are known together.")
+        w("Hops do not, because the next hop's addresses are unknown until the current")
+        w("returns. So parallelism divides the first and leaves the second, and latency")
+        w("is bounded below by `hops x RTT` however wide the pipe.\n")
+        w("FTS5 is marked unbatchable: `xRead` is synchronous, so SQLite asks for its")
+        w("next page only after the current one returns. That is a property of the")
+        w("client, not of the index.\n")
+        try:
+            from analyze.concurrency import rows_for_comparison
+            access_rows = rows_for_comparison()
+        except Exception as exc:  # measurement files incomplete
+            access_rows = []
+            w(f"_Concurrency table unavailable: {exc}_\n")
+        for profile in ("lte", "3g", "satellite"):
+            if not access_rows:
+                break
+            rtt, mbps = PROFILES[profile]
+            w(f"**`{profile}`** ({rtt:g} ms RTT, {mbps:g} Mbit/s), seconds per query:\n")
+            w("| system | hops | requests | " +
+              " | ".join(f"c={c}" for c in CONCURRENCY_LEVELS) + " | floor |")
+            w("|---|---:|---:|" + "---:|" * (len(CONCURRENCY_LEVELS) + 1))
+            for label, acc in access_rows:
+                cells = " | ".join(
+                    fmt_seconds(query_seconds(acc, profile, c)["total_s"])
+                    for c in CONCURRENCY_LEVELS
+                )
+                floor = fmt_seconds(query_seconds(acc, profile, 1)["floor_s"])
+                w(f"| {label} | {acc.hops} | {acc.requests} | {cells} | **{floor}** |")
+            w("")
 
     out = REPO / "docs" / "RESULTS.md"
     out.parent.mkdir(parents=True, exist_ok=True)

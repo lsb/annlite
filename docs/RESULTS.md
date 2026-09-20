@@ -277,3 +277,62 @@ this one includes it, which is the comparison that decides the design.
 | Dense (MiniLM) | 0.350 | 0.698 | 0.932 | 0.463 | 1,536 | 0.31 |
 | Late interaction (LateOn) | 0.454 | 0.780 | 0.950 | 0.567 | 28,240 | 120.03 |
 
+## Three systems on one corpus
+
+Code corpus, 3,366 documents, 500 queries. Same single-gold quality
+definition for all three, and the same pass-through VFS counting real file
+pages. `success@1` has a ceiling of 0.962: 7.4% of queries share a docstring
+with another function and cannot be answered as known-item retrieval.
+
+CPU is process time measured under contention — the ordering is meaningful,
+the absolute values are an upper bound.
+
+| system | configuration | success@1 | of max | MRR@10 | pages | requests | bytes/doc | cpu ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| fts5 | post-vacuum | 0.280 | 0.291 | 0.362 | 25.5 | 12.3 | 764 | 2.09 |
+| dense | bfs/resident/L=128/beam=4/rerank=0/m=64 | 0.348 | 0.362 | 0.456 | 67.4 | 66.7 | 2,420 | 1.06 |
+| dense | bfs/resident/L=128/beam=4/rerank=100/m=32 | 0.348 | 0.362 | 0.461 | 158.6 | 125.9 | 2,352 | 1.61 |
+| late | k=1024/probe=8/rerank=0 | 0.240 | 0.249 | 0.343 | 592.1 | 41.8 | 928 | 23.76 |
+| late | k=1024/probe=8/rerank=100 | 0.454 | 0.472 | 0.563 | 1,790.8 | 138.7 | 29,196 | 61.92 |
+
+### Requests in flight
+
+Requests within a hop overlap, because their addresses are known together.
+Hops do not, because the next hop's addresses are unknown until the current
+returns. So parallelism divides the first and leaves the second, and latency
+is bounded below by `hops x RTT` however wide the pipe.
+
+FTS5 is marked unbatchable: `xRead` is synchronous, so SQLite asks for its
+next page only after the current one returns. That is a property of the
+client, not of the index.
+
+**`lte`** (70 ms RTT, 15 Mbit/s), seconds per query:
+
+| system | hops | requests | c=1 | c=6 | c=32 | c=128 | floor |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FTS5 | 12 | 12 | 896 ms | 896 ms | 896 ms | 896 ms | **896 ms** |
+| dense m=64, no rerank | 34 | 67 | 4.9 s | 2.5 s | 2.5 s | 2.5 s | **2.5 s** |
+| dense m=32, rerank 100 | 35 | 126 | 10.1 s | 2.8 s | 2.8 s | 2.8 s | **2.8 s** |
+| late k=1024, no rerank | 2 | 42 | 4.2 s | 1.9 s | 1.4 s | 1.4 s | **1.4 s** |
+| late k=1024, rerank 100 | 3 | 139 | 13.8 s | 5.6 s | 4.3 s | 4.1 s | **4.1 s** |
+
+**`3g`** (200 ms RTT, 1.6 Mbit/s), seconds per query:
+
+| system | hops | requests | c=1 | c=6 | c=32 | c=128 | floor |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FTS5 | 12 | 12 | 2.9 s | 2.9 s | 2.9 s | 2.9 s | **2.9 s** |
+| dense m=64, no rerank | 34 | 67 | 15.0 s | 8.2 s | 8.2 s | 8.2 s | **8.2 s** |
+| dense m=32, rerank 100 | 35 | 126 | 31.2 s | 10.2 s | 10.2 s | 10.2 s | **10.2 s** |
+| late k=1024, no rerank | 2 | 42 | 20.5 s | 13.7 s | 12.5 s | 12.5 s | **12.5 s** |
+| late k=1024, rerank 100 | 3 | 139 | 64.9 s | 41.5 s | 37.9 s | 37.3 s | **37.3 s** |
+
+**`satellite`** (600 ms RTT, 20 Mbit/s), seconds per query:
+
+| system | hops | requests | c=1 | c=6 | c=32 | c=128 | floor |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FTS5 | 12 | 12 | 7.2 s | 7.2 s | 7.2 s | 7.2 s | **7.2 s** |
+| dense m=64, no rerank | 34 | 67 | 40.9 s | 20.5 s | 20.5 s | 20.5 s | **20.5 s** |
+| dense m=32, rerank 100 | 35 | 126 | 84.3 s | 21.3 s | 21.3 s | 21.3 s | **21.3 s** |
+| late k=1024, no rerank | 2 | 42 | 26.2 s | 5.8 s | 2.2 s | 2.2 s | **2.2 s** |
+| late k=1024, rerank 100 | 3 | 139 | 87.5 s | 17.3 s | 6.5 s | 4.7 s | **4.7 s** |
+

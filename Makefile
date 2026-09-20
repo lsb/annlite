@@ -233,3 +233,11 @@ data/embeddings/code-late.f32:
 # sections are simply omitted.
 matrix:
 	$(PYTHON) tools/analyze/matrix.py
+
+# Seconds per query against requests in flight, for each system. Reads only the
+# committed measurement files, so it needs no benchmark re-run.
+.PHONY: concurrency
+concurrency:
+	@$(PYTHON) tools/analyze/concurrency.py lte
+	@echo
+	@$(PYTHON) tools/analyze/concurrency.py satellite
