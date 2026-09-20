@@ -324,19 +324,19 @@ Produced by `make fts5-10k`, `make ann-gold SCALE=10k` and
 | late interaction | k=1024/probe=8/rerank=0 | 0.268 | 0.302 | 1,267.8 | 57.6 | 2 |
 | late interaction | k=1024/probe=8/rerank=100 | 0.536 | 0.550 | 1,890.0 | 156.7 | 3 |
 
-**Lexical matching wins this corpus outright, on both axes.** That is the
-expected result and it is worth stating plainly: a document of fifty
-unrelated dictionary words has no topic for an embedding to capture, so
-section 5.4's finding shows up here as a 0.826 against 0.536 and 0.106.
-The dense index is not failing as an index -- it recovers 0.757 of its own
-exact search's top-10 -- it is the representation that has nothing to grip.
-Late interaction lands in between because MaxSim scores individual tokens,
-which is closer to what a term match does.
+Lexical matching is more accurate and less expensive than either vector
+method on this corpus. This is the expected result: a document of fifty
+unrelated dictionary words has no subject matter for an embedding to
+represent, which is the finding of section 5.4 measured on a single scale.
+The dense result is not an indexing failure, since the same run recalls
+0.757 of its own exact search's top ten; the limitation is in the
+representation. Late interaction falls between the two because MaxSim
+scores individual tokens, which is closer to a term match.
 
-The cost ranking is the same: FTS5 reaches 26.6 pages where the dense index
-needs 103.7 and late interaction 1,890. The case for the graph index is at
-a million documents, where FTS5's per-match lookups stop being cheap
-(section 16.3); at ten thousand it has no case to make.
+The cost ordering is the same: FTS5 reads 26.6 pages per query, the dense
+index 103.7 and late interaction 1,890. A graph index becomes preferable at
+the scale where FTS5's per-match lookups become expensive, which is nearer
+one million documents than ten thousand (section 16.3).
 
 ## Residual quantization (late interaction)
 

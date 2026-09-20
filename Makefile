@@ -141,9 +141,17 @@ clean: clean-data
 WASM_TARGET := wasm32-unknown-unknown
 WASM_OUT    := web/pkg
 
-.PHONY: wasm wasm-test tokenizer-parity
+.PHONY: wasm wasm-test tokenizer-parity check-wasm-target
 
-wasm:
+# Without the target installed, cargo fails with a raw "can't find crate for `core`"
+# from deep inside a dependency, which says nothing about the actual cause.
+check-wasm-target:
+	@rustup target list --installed 2>/dev/null | grep -qx '$(WASM_TARGET)' || { \
+	  echo "error: the $(WASM_TARGET) target is not installed."; \
+	  echo "  rustup target add $(WASM_TARGET)"; \
+	  exit 1; }
+
+wasm: check-wasm-target
 	$(CARGO) build --release -p annlite-wasm --target $(WASM_TARGET)
 	@command -v wasm-bindgen >/dev/null 2>&1 || { \
 	  echo "error: wasm-bindgen not found."; \
