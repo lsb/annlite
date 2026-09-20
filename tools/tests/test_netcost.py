@@ -56,3 +56,30 @@ def test_crossover_returns_none_when_never_better():
     worse = Access(hops=100, requests=1000, bytes_fetched=10**7, preload_bytes=10**8)
     better = Access(hops=1, requests=1, bytes_fetched=4096)
     assert crossover(worse, better, "lte", max_queries=100) is None
+
+
+def test_hop_floor_survives_unlimited_concurrency():
+    # Requests within a hop overlap; hops do not, because the next hop's addresses
+    # are unknown until the current one returns.
+    a = Access(hops=18, requests=1000, bytes_fetched=0)
+    assert query_seconds(a, "lte", 100_000)["latency_s"] == 18 * 0.07
+    assert query_seconds(a, "lte", 100_000)["total_s"] == query_seconds(a, "lte", 1)["floor_s"]
+
+
+def test_unbatchable_client_ignores_concurrency():
+    # A synchronous VFS discovers its next page only after the current returns, so
+    # the link's capacity is irrelevant to it.
+    serial = Access(hops=1537, requests=1537, bytes_fetched=0, batchable=False)
+    assert (
+        query_seconds(serial, "lte", 1)["total_s"]
+        == query_seconds(serial, "lte", 128)["total_s"]
+    )
+
+
+def test_concurrency_helps_a_batchable_client_until_the_floor():
+    from analyze.netcost import concurrency_sweep
+
+    a = Access(hops=3, requests=139, bytes_fetched=0)
+    sweep = concurrency_sweep(a, "lte")
+    assert sweep[1] > sweep[6] > sweep[32], "more parallelism should help"
+    assert sweep[128] == 3 * 0.07, "and should bottom out at the hop floor"

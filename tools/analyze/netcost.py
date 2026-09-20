@@ -35,8 +35,13 @@ PROFILES: dict[str, tuple[float, float]] = {
 }
 
 PAGE_BYTES = 4096
-#: Browsers cap concurrent connections per origin at six; a wider frontier queues.
+
+#: HTTP/1.1 browsers cap connections per origin at six. HTTP/2 and HTTP/3 multiplex
+#: over one connection and allow ~100 concurrent streams, which is what a CDN
+#: actually serves today, so six is a floor rather than the expected case. The
+#: comparison sweeps this rather than assuming it.
 DEFAULT_CONCURRENCY = 6
+CONCURRENCY_LEVELS = (1, 6, 32, 128)
 
 
 @dataclass
@@ -50,24 +55,53 @@ class Access:
     #: Bytes that can be fetched once per session rather than once per query,
     #: such as a resident PQ codebook.
     preload_bytes: int = 0
+    #: Whether the client can have more than one request of a hop in flight.
+    #:
+    #: This is a property of the *client*, not of the network, and it is the most
+    #: consequential asymmetry in the comparison. A purpose-built client -- the
+    #: `SearchSession` in `annlite-wasm`, say -- hands out a whole frontier of node
+    #: ids per round and can issue them together. SQLite reached through a VFS
+    #: cannot: `xRead` is a synchronous, one-page-at-a-time interface, so FTS5 over
+    #: `sql.js-httpvfs` discovers its next page only after the current one returns,
+    #: whatever the link would allow. Setting this False pins effective concurrency
+    #: at 1 no matter what is passed in.
+    batchable: bool = True
 
 
 def query_seconds(
     access: Access, profile: str, concurrency: int = DEFAULT_CONCURRENCY
 ) -> dict[str, float]:
-    """Simulated wall-clock seconds for one query, excluding any preload."""
+    """Simulated wall-clock seconds for one query, excluding any preload.
+
+    Reports `floor_s` alongside the total: `hops * rtt`, the cost that survives
+    unlimited parallelism. Requests within a hop can be overlapped, so concurrency
+    divides them; hops cannot, because the next hop's addresses are not known until
+    the current one returns. Any system's latency is therefore bounded below by its
+    hop count, and that bound is where the architectures actually differ.
+    """
     rtt_ms, mbps = PROFILES[profile]
     rtt = rtt_ms / 1000.0
 
-    # Requests spread evenly over the hops; each hop pays ceil(per_hop / concurrency)
-    # round-trips because only `concurrency` are in flight at once.
+    effective = 1 if not access.batchable else max(1, concurrency)
     hops = max(access.hops, 1)
     per_hop = max(1, -(-access.requests // hops))
-    waves = -(-per_hop // max(1, concurrency))
+    waves = -(-per_hop // effective)
     latency = hops * waves * rtt
 
     transfer = 0.0 if mbps == float("inf") else access.bytes_fetched * 8 / (mbps * 1e6)
-    return {"latency_s": latency, "transfer_s": transfer, "total_s": latency + transfer}
+    return {
+        "latency_s": latency,
+        "transfer_s": transfer,
+        "total_s": latency + transfer,
+        "floor_s": hops * rtt + transfer,
+    }
+
+
+def concurrency_sweep(
+    access: Access, profile: str, levels: tuple[int, ...] = CONCURRENCY_LEVELS
+) -> dict[int, float]:
+    """Total seconds at each concurrency level, for one access pattern."""
+    return {c: query_seconds(access, profile, c)["total_s"] for c in levels}
 
 
 def preload_seconds(preload_bytes: int, profile: str) -> float:

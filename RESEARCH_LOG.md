@@ -1358,7 +1358,88 @@ counting the preload in full, one query costs 35 s against the baseline's 111 s.
 
 ---
 
-## 17. Open items
+## 17. Three systems, one corpus, and what parallelism does to the ranking
+
+Sections 9 to 16 measured FTS5, the dense index and late interaction on different
+corpora with different metrics, so no honest three-way comparison existed. All three
+are now measured on the **code corpus** (3,366 documents, 500 queries), with the same
+single-gold quality definition and the same pass-through VFS counting real file
+pages.
+
+### 17.1 Cost against quality
+
+`success@1` ceiling is 0.962 (section 15.1). CPU is process time under contention —
+ordering is meaningful, absolute values are an upper bound.
+
+| system | configuration | success@1 | of max | MRR@10 | pages | requests | bytes/doc | cpu ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| FTS5 | post-vacuum | 0.280 | 0.291 | 0.362 | **25.5** | **12.3** | **764** | 2.09 |
+| dense | L=128, m=64, no rerank | 0.348 | 0.362 | 0.456 | 67.4 | 66.7 | 2,420 | **1.06** |
+| dense | L=128, m=32, rerank 100 | 0.348 | 0.362 | 0.461 | 158.6 | 125.9 | 2,352 | 1.61 |
+| late | k=1,024, no rerank | 0.240 | 0.249 | 0.343 | 592.1 | 41.8 | 928 | 23.76 |
+| **late** | **k=1,024, rerank 100** | **0.454** | **0.472** | **0.563** | 1,790.8 | 138.7 | 29,196 | 61.92 |
+
+The three axes disagree, which is the useful part. Late interaction wins quality
+outright and loses every cost measure — 70x the pages of FTS5, 38x the bytes, 30x the
+CPU. FTS5 is cheapest on all three and worst on quality. Dense sits between, and is
+cheapest on CPU.
+
+One result worth isolating: **dense at m=64 without reranking matches m=32 with
+reranking on quality (0.348 either way) at 67 pages instead of 159.** Spending 32
+more bytes per document to avoid fetching a hundred scattered vectors is strictly
+better here.
+
+### 17.2 Finding: requests in flight reorder the systems completely
+
+Page counts hide the distinction that decides latency. Requests *within* a hop can be
+overlapped, because their addresses are known together; hops cannot, because the next
+hop's addresses are unknown until the current returns. Parallelism divides the first
+and leaves the second, so latency is bounded below by `hops x RTT` however wide the
+pipe — and the three architectures differ enormously in hop count.
+
+| system | hops | why |
+|---|---:|---|
+| FTS5 | 12 | equal to its requests: `xRead` is synchronous, so SQLite asks for the next page only after the current returns. **It cannot batch at all** — a property of the client, not the index. |
+| dense | 34–35 | one per beam round; each frontier depends on the last. |
+| **late interaction** | **2–3** | fixed stages: postings, centroid scoring, optional rerank. Independent of corpus size. |
+
+Seconds per query on **`satellite`** (600 ms RTT, 20 Mbit/s):
+
+| system | c=1 | c=6 | c=32 | c=128 | floor |
+|---|---:|---:|---:|---:|---:|
+| FTS5 | 7.24 | 7.24 | 7.24 | 7.24 | 7.24 |
+| dense m=64, no rerank | 40.91 | 20.51 | 20.51 | 20.51 | 20.51 |
+| dense m=32, rerank 100 | 84.26 | 21.26 | 21.26 | 21.26 | 21.26 |
+| **late, no rerank** | 26.17 | 5.77 | **2.17** | **2.17** | **2.17** |
+| late, rerank 100 | 87.53 | 17.33 | 6.53 | **4.73** | 4.73 |
+
+**Serially, FTS5 wins by 3.6x. With 32 requests in flight, late interaction wins by
+3.3x** — a complete reversal, from the same measurements, purely by allowing what a
+browser already does. The dense index barely improves past six, because its 34
+dependent rounds are a floor no parallelism touches.
+
+The profile decides which term dominates:
+
+| link | winner | why |
+|---|---|---|
+| `3g` (200 ms, 1.6 Mbit/s) | FTS5 at every concurrency | bandwidth-bound; late interaction moves 7.3 MB |
+| `lte` (70 ms, 15 Mbit/s) | FTS5 (0.90 s) | corpus too small for posting lists to hurt |
+| `satellite` (600 ms, 20 Mbit/s) | **late interaction, given c >= 32** | latency-bound, and hops are what latency charges for |
+
+So "how many pages does a query touch" is the wrong single question. **Pages bound
+the bytes; hops bound the latency; and only hops are immune to parallelism.** Late
+interaction's flat 2–3 hops is a structural property — no graph to walk — that no
+amount of page-locality work on the graph index can match, and it is invisible in
+every table before this one.
+
+*Caveat.* Late interaction's floor on `satellite` is transfer-bound rather than
+latency-bound once reranking is on: 4.73 s for 3 hops is 1.8 s of round-trips and
+2.9 s of moving 7.3 MB. Section 15.2's unresolved gap — no residual quantization, so
+reranking reads uncompressed vectors — is what puts it there.
+
+---
+
+## 18. Open items
 
 * **Blocked:** `tokenizer.json` for `LateOn-Code-edge` (§3.2) — gates milestone 5.
 * **Needed:** an emscripten toolchain for the WASM milestone.
